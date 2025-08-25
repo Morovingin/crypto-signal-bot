@@ -289,7 +289,7 @@ def plot_price_and_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> 
 # Report building
 # ------------------------------
 def build_hourly_report(symbol: str) -> Tuple[str, bytes]:
-    now = datetime.datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    now = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     lines = [f"⏱ Hourly report for {symbol} — {now}\n"]
     votes_summary = {}
     chosen_image = b""
@@ -418,7 +418,7 @@ app = FastAPI(title="Crypto Signal Bot")
 async def root():
     return {
         "status": "crypto-signal-bot running",
-        "time": datetime.datetime.datetime.utcnow().isoformat(),
+        "time": datetime.datetime.utcnow().isoformat(),
         "service": "crypto-signal-bot",
         "exchange": EXCHANGE
     }
