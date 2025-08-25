@@ -1,382 +1,470 @@
-import os, io, math, time, json, asyncio, random, textwrap
-from datetime import datetime, timezone, timedelta
-import pytz
+# main.py
+import os
+import io
+import math
+import time
+import json
 import httpx
+import datetime
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, Response
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-
-# ТА-библиотека (без компиляции, подходит для фри-хостинга)
-from ta.momentum import RSIIndicator, StochRSIIndicator
-from ta.trend import EMAIndicator, SMAIndicator, MACD
-from ta.volatility import BollingerBands, AverageTrueRange
-
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# -------------------- Конфиг --------------------
-PAIRS = os.getenv("PAIRS", "DOGEUSDT,ADAUSDT").upper().split(",")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-FRED_API_KEY = os.getenv("FRED_API_KEY", "")  # опционально
-BYBIT_BASE = "https://api.bybit.com"
-TZ_MOSCOW = pytz.timezone("Europe/Moscow")
-APP_TZ = timezone.utc  # всё планируем в UTC (04:00 МСК = 01:00 UTC)
-HEADERS = {"User-Agent": "crypto-signal-bot/1.0"}
+from typing import Dict, List, Tuple
+from fastapi import FastAPI
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# Интервалы Bybit: '15','60','240','720' для 15m/1h/4h/12h
-TIMEFRAMES = {"15m": "15", "1h": "60", "4h": "240", "12h": "720"}
+# TA indicators from `ta` package
+from ta.momentum import RSIIndicator, StochasticOscillator, StochRSIIndicator
+from ta.trend import MACD, SMAIndicator, EMAIndicator
+from ta.volatility import BollingerBands
 
-# Хранилище последнего отчёта в памяти
-LAST_REPORT_TEXT = ""
-LAST_DAILY_IMAGE = {}  # {"DOGEUSDT": bytes, ...}
+# ------------------------------
+# Config / environment
+# ------------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+PORT = int(os.getenv("PORT", 10000))
 
-# -------------------- Веб-приложение --------------------
-app = FastAPI()
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables")
 
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True, "utc": datetime.now(timezone.utc).isoformat()}
+# Exchanges endpoints (public)
+BINANCE_KLINES_ENDPOINT = "https://api.binance.com/api/v3/klines"
+BYBIT_KLINES_ENDPOINT = "https://api.bybit.com/public/linear/kline"  # linear symbol (USDT)
+# Note: Bybit endpoint params differ; we'll use Binance for primary data and Bybit as optional
 
-@app.get("/last_report")
-async def last_report():
-    return Response(LAST_REPORT_TEXT or "Пока нет отчётов", media_type="text/plain; charset=utf-8")
+SYMBOLS = ["DOGEUSDT", "ADAUSDT"]
+TIMEFRAMES = {
+    "15m": {"interval": "15m", "limit": 200},
+    "1h": {"interval": "1h", "limit": 200},
+    "4h": {"interval": "4h", "limit": 200},
+    "12h": {"interval": "12h", "limit": 200}
+}
 
-# -------------------- Вспомогательные функции --------------------
-def ts_to_dt_ms(ms):
-    return datetime.fromtimestamp(int(ms)/1000, tz=timezone.utc)
+# Scheduler timezone
+SCHED_TZ = "Europe/Moscow"
 
-async def bybit_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+# ------------------------------
+# Utilities: HTTP fetch
+# ------------------------------
+client = httpx.Client(timeout=20.0)
+
+def fetch_binance_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     """
-    Bybit v5 Market Kline (spot)
-    https://api.bybit.com/v5/market/kline?category=spot&symbol=BTCUSDT&interval=60
+    Fetch klines from Binance public API and return DataFrame with columns:
+    ['open_time','open','high','low','close','volume','close_time',...]
+    All price columns are float and index is datetime of open_time.
     """
-    url = f"{BYBIT_BASE}/v5/market/kline"
-    params = {"category": "spot", "symbol": symbol, "interval": interval, "limit": str(limit)}
-    async with httpx.AsyncClient(timeout=30.0, headers=HEADERS) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit error: {data}")
-    rows = data["result"]["list"]  # [[start,open,high,low,close,volume,turnover], ...] newest first
-    rows = list(reversed(rows))    # делаем от старых к новым
-    cols = ["start","open","high","low","close","volume","turnover"]
-    df = pd.DataFrame(rows, columns=cols)
-    for c in ["open","high","low","close","volume","turnover"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["datetime"] = pd.to_datetime(df["start"].astype("int64"), unit="ms", utc=True)
-    df.set_index("datetime", inplace=True)
-    return df
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    r = client.get(BINANCE_KLINES_ENDPOINT, params=params)
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        raise RuntimeError("Empty kline data")
+    df = pd.DataFrame(data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time","quote_asset_volume","num_trades",
+        "taker_buy_base_asset_volume","taker_buy_quote_asset_volume","ignore"
+    ])
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.set_index("open_time", inplace=True)
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    return df[["open","high","low","close","volume"]]
 
+def fetch_bybit_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    """
+    Fetch klines from Bybit public API.
+    interval here: "15", "60", "240", "720" (minutes) for Bybit.
+    We'll map common intervals.
+    """
+    mapping = {"15m":"15", "1h":"60", "4h":"240", "12h":"720"}
+    if interval not in mapping:
+        raise ValueError("Unsupported interval for Bybit")
+    params = {"symbol": symbol.upper(), "interval": mapping[interval], "limit": limit}
+    r = client.get(BYBIT_KLINES_ENDPOINT, params=params)
+    r.raise_for_status()
+    jd = r.json()
+    if "result" in jd and isinstance(jd["result"], list):
+        data = jd["result"]
+    elif "result" in jd and "list" in jd["result"]:
+        data = jd["result"]["list"]
+    else:
+        data = jd.get("result", [])
+    if not data:
+        raise RuntimeError("Empty bybit kline data")
+    df = pd.DataFrame(data)
+    # Bybit format may contain 'open_time' or 'start_at'(unix)
+    if "start_at" in df.columns:
+        df["open_time"] = pd.to_datetime(df["start_at"], unit="s")
+    elif "open_time" in df.columns:
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="s")
+    else:
+        # fallback: use 't' or first column
+        df["open_time"] = pd.to_datetime(df.iloc[:,0], unit="s")
+    df.set_index("open_time", inplace=True)
+    # Expected columns: open, high, low, close, volume
+    for col in ["open","high","low","close","volume"]:
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+        elif col.capitalize() in df.columns:
+            df[col] = df[col.capitalize()].astype(float)
+        else:
+            df[col] = 0.0
+    return df[["open","high","low","close","volume"]]
+
+# ------------------------------
+# Indicators calculation
+# ------------------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # Скользящие
-    df["ema20"]  = EMAIndicator(df["close"], window=20).ema_indicator()
-    df["ema50"]  = EMAIndicator(df["close"], window=50).ema_indicator()
-    df["ema200"] = EMAIndicator(df["close"], window=200).ema_indicator()
-    df["sma20"]  = SMAIndicator(df["close"], window=20).sma_indicator()
-    # RSI/StochRSI
-    df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
-    st = StochRSIIndicator(df["close"], window=14, smooth1=3, smooth2=3)
-    df["stochrsi_k"] = st.stochrsi_k()
-    df["stochrsi_d"] = st.stochrsi_d()
-    # MACD
-    macd = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    df["macd_hist"] = macd.macd_diff()
-    # Bollinger
-    bb = BollingerBands(df["close"], window=20, window_dev=2)
-    df["bb_mid"] = bb.bollinger_mavg()
-    df["bb_up"]  = bb.bollinger_hband()
-    df["bb_low"] = bb.bollinger_lband()
-    # ATR (для SL/TP)
-    atr = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14)
-    df["atr"] = atr.average_true_range()
-    # MA по объёмам (простая)
-    df["vol_sma20"] = df["volume"].rolling(20).mean()
-    return df
+    """
+    Given df with ['open','high','low','close','volume'] compute indicators and return new df copy:
+      - rsi (14)
+      - macd (fast=12, slow=26, signal=9): macd_line, macd_signal, macd_hist
+      - bb: bb_mavg, bb_hband, bb_lband, bb_percent
+      - sma20, sma50, ema20, ema50
+      - stoch_rsi_k, stoch_rsi_d
+    """
+    out = df.copy()
+    close = out["close"]
 
-def recent_swing_levels(df: pd.DataFrame, lookback: int = 250):
-    d = df.tail(lookback)
-    hi = float(d["high"].max())
-    lo = float(d["low"].min())
-    # На случай вырожденности
-    if not math.isfinite(hi) or not math.isfinite(lo) or hi <= lo:
-        return None
-    # Уровни Фибоначчи (0..1 на отрезке lo-hi)
+    # RSI 14
+    rsi = RSIIndicator(close=close, window=14, fillna=True).rsi()
+    out["rsi"] = rsi
+
+    # MACD
+    macd = MACD(close=close, window_slow=26, window_fast=12, window_sign=9, fillna=True)
+    out["macd_line"] = macd.macd()
+    out["macd_signal"] = macd.macd_signal()
+    out["macd_hist"] = macd.macd_diff()
+
+    # Bollinger Bands (20, 2)
+    bb = BollingerBands(close=close, window=20, window_dev=2, fillna=True)
+    out["bb_mavg"] = bb.bollinger_mavg()
+    out["bb_hband"] = bb.bollinger_hband()
+    out["bb_lband"] = bb.bollinger_lband()
+    # position relative to bands
+    out["bb_pct"] = (close - out["bb_lband"]) / (out["bb_hband"] - out["bb_lband"] + 1e-12)
+
+    # SMA / EMA
+    out["sma20"] = SMAIndicator(close=close, window=20, fillna=True).sma_indicator()
+    out["sma50"] = SMAIndicator(close=close, window=50, fillna=True).sma_indicator()
+    out["ema20"] = EMAIndicator(close=close, window=20, fillna=True).ema_indicator()
+    out["ema50"] = EMAIndicator(close=close, window=50, fillna=True).ema_indicator()
+
+    # Stochastic RSI
+    stoch_rsi = StochRSIIndicator(close=close, window=14, smooth1=3, smooth2=3, fillna=True)
+    out["stoch_rsi_k"] = stoch_rsi.stochrsi_k()
+    out["stoch_rsi_d"] = stoch_rsi.stochrsi_d()
+
+    return out
+
+# ------------------------------
+# Support / Resistance and Fib
+# ------------------------------
+def pivot_support_resistance(series: pd.Series) -> Dict[str, float]:
+    """
+    Simple pivot calculation based on last candle:
+      Pivot = (High + Low + Close) / 3
+      R1 = 2*Pivot - Low
+      S1 = 2*Pivot - High
+    Return dict with pivot, r1, s1
+    """
+    high = float(series["high"])
+    low = float(series["low"])
+    close = float(series["close"])
+    pivot = (high + low + close) / 3.0
+    r1 = 2*pivot - low
+    s1 = 2*pivot - high
+    return {"pivot": pivot, "r1": r1, "s1": s1}
+
+def fib_levels(last_low: float, last_high: float) -> Dict[str, float]:
+    """
+    Return Fibonacci retracement levels between last_low and last_high
+    """
+    diff = last_high - last_low
     levels = {
-        "0%": lo,
-        "23.6%": lo + 0.236*(hi-lo),
-        "38.2%": lo + 0.382*(hi-lo),
-        "50.0%": lo + 0.5*(hi-lo),
-        "61.8%": lo + 0.618*(hi-lo),
-        "78.6%": lo + 0.786*(hi-lo),
-        "100%": hi,
+        "0.0%": last_high,
+        "23.6%": last_high - 0.236*diff,
+        "38.2%": last_high - 0.382*diff,
+        "50.0%": last_high - 0.5*diff,
+        "61.8%": last_high - 0.618*diff,
+        "100.0%": last_low
     }
     return levels
 
-def local_support_resistance(df: pd.DataFrame, window: int = 10, topn: int = 3):
-    # Простая детекция локальных экстремумов
-    lows  = df["low"]
-    highs = df["high"]
-    sups = []
-    ress = []
-    for i in range(window, len(df)-window):
-        if lows.iloc[i] == lows.iloc[i-window:i+window+1].min():
-            sups.append((df.index[i], float(lows.iloc[i])))
-        if highs.iloc[i] == highs.iloc[i-window:i+window+1].max():
-            ress.append((df.index[i], float(highs.iloc[i])))
-    # Берём последние и уникализируем уровни (по расстоянию)
-    def pick(levels):
-        levels = sorted(levels, key=lambda x: x[0], reverse=True)
-        res = []
-        for _, price in levels:
-            if all(abs(price - p) / p > 0.01 for p in res):  # не ближе 1%
-                res.append(price)
-            if len(res) >= topn:
-                break
-        return sorted(res)
-    return pick(sups), pick(ress)
-
-def signal_from_indicators(df: pd.DataFrame):
-    """Возвращает ('BUY'|'SELL'|'NEUTRAL', причины:list[str]) по последней свече."""
-    row = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else row
-    reasons = []
-    score = 0
-
-    # Тренд MA/EMA
-    if row.close > row.ema50 > row.ema200:
-        score += 2; reasons.append("цена>EMA50>EMA200 (бычий тренд)")
-    elif row.close < row.ema50 < row.ema200:
-        score -= 2; reasons.append("цена<EMA50<EMA200 (медвежий тренд)")
-
-    # MACD
-    if row.macd_hist > 0 and prev.macd_hist <= 0:
-        score += 2; reasons.append("MACD: бычий кроссовер")
-    elif row.macd_hist < 0 and prev.macd_hist >= 0:
-        score -= 2; reasons.append("MACD: медвежий кроссовер")
-    else:
-        if row.macd_hist > 0: score += 0.5
-        if row.macd_hist < 0: score -= 0.5
+# ------------------------------
+# Signal logic (simple voting)
+# ------------------------------
+def score_signals(ind_df: pd.DataFrame) -> Tuple[str, Dict[str,int]]:
+    """
+    Given indicators DataFrame for a timeframe, compute a simple vote:
+     - RSI < 30 => +1 buy, >70 => +1 sell
+     - MACD histogram positive => buy, negative => sell
+     - Price above ema20 => buy, below => sell
+     - Bollinger: price near upper band => sell, near lower band => buy
+     - StochRSI: <0.2 buy, >0.8 sell
+    Sum votes and return final recommendation and votes dict.
+    """
+    row = ind_df.iloc[-1]
+    votes = {"buy": 0, "sell": 0, "neutral": 0}
+    price = row["close"]
 
     # RSI
-    if row.rsi < 30: score += 1.5; reasons.append("RSI<30 (перепроданность)")
-    elif row.rsi > 70: score -= 1.5; reasons.append("RSI>70 (перекупленность)")
-    elif row.rsi > 55: score += 0.5
-    elif row.rsi < 45: score -= 0.5
-
-    # StochRSI
-    if row.stochrsi_k > 0.8 and row.stochrsi_k < prev.stochrsi_k:
-        score -= 1; reasons.append("StochRSI разворот сверху")
-    if row.stochrsi_k < 0.2 and row.stochrsi_k > prev.stochrsi_k:
-        score += 1; reasons.append("StochRSI разворот снизу")
-
-    # Bollinger Bands (контртренд)
-    if row.close <= row.bb_low: score += 1; reasons.append("касание нижней BB")
-    if row.close >= row.bb_up:  score -= 1; reasons.append("касание верхней BB")
-
-    # Объёмы
-    if row.volume > (row.vol_sma20 * 1.3):
-        reasons.append("объём выше среднего (импульс)")
-        score += 0.5
-
-    decision = "NEUTRAL"
-    if score >= 2: decision = "BUY"
-    if score <= -2: decision = "SELL"
-    return decision, reasons, row
-
-def sl_tp_from_atr(side: str, price: float, atr: float, supports: list, resistances: list):
-    """Рекомендации по SL/TP на основе ATR и ближайших S/R."""
-    rr = 1.5
-    if side == "BUY":
-        # SL чуть ниже ближайшей поддержки или 1.2*ATR
-        sl = min([s for s in supports if s < price] + [price - 1.2*atr])
-        tp1 = price + rr*atr
-        tp2 = price + 2*rr*atr
-    elif side == "SELL":
-        sl = max([r for r in resistances if r > price] + [price + 1.2*atr])
-        tp1 = price - rr*atr
-        tp2 = price - 2*rr*atr
+    if row["rsi"] < 30:
+        votes["buy"] += 1
+    elif row["rsi"] > 70:
+        votes["sell"] += 1
     else:
-        sl = None; tp1=None; tp2=None
-    return sl, tp1, tp2
+        votes["neutral"] += 0
 
-async def telegram_send_text(text: str):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        await client.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900], "parse_mode":"HTML"})
+    # MACD hist
+    if row["macd_hist"] > 0:
+        votes["buy"] += 1
+    elif row["macd_hist"] < 0:
+        votes["sell"] += 1
 
-async def telegram_send_photo(png_bytes: bytes, caption: str):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("chart.png", png_bytes, "image/png")}
-    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        await client.post(url, data=data, files=files)
+    # EMA20 trend
+    if row["close"] > row["ema20"]:
+        votes["buy"] += 1
+    else:
+        votes["sell"] += 1
 
-async def fetch_m2_latest():
-    """Опционально: последний M2 (M2SL, monthly, SA) из FRED API."""
-    if not FRED_API_KEY:
-        return None
-    url = "https://api.stlouisfed.org/fred/series/observations"
-    params = {"series_id": "M2SL", "api_key": FRED_API_KEY, "file_type": "json"}
-    async with httpx.AsyncClient(timeout=30.0, headers=HEADERS) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-    obs = [o for o in data.get("observations", []) if o.get("value") not in (".", None)]
-    if not obs:
-        return None
-    last = obs[-1]
-    return {"date": last["date"], "value": float(last["value"])}
+    # Bollinger
+    if row["bb_pct"] > 0.85:
+        votes["sell"] += 1
+    elif row["bb_pct"] < 0.15:
+        votes["buy"] += 1
 
-def make_daily_simulation_chart(symbol: str, df_1h: pd.DataFrame) -> bytes:
-    """Строим PNG: свечи (1ч), индикаторы и 24-часовую стох. симуляцию."""
-    close = df_1h["close"]
-    # Волатильность по последним ~7 дням (24*7 часов)
-    hourly_ret = close.pct_change().dropna()
-    sigma = float(hourly_ret.tail(24*7).std())
-    price0 = float(close.iloc[-1])
+    # Stoch RSI
+    if row["stoch_rsi_k"] < 20:
+        votes["buy"] += 1
+    elif row["stoch_rsi_k"] > 80:
+        votes["sell"] += 1
 
-    steps = 24
-    paths = 200
-    sims = np.zeros((paths, steps+1))
-    sims[:,0] = price0
-    for p in range(paths):
-        shocks = np.random.normal(loc=0.0, scale=sigma, size=steps)
-        series = [price0]
-        for e in shocks:
-            series.append(series[-1] * (1.0 + e))
-        sims[p,:] = series
-    median_path = np.median(sims, axis=0)
-    p10 = np.percentile(sims, 10, axis=0)
-    p90 = np.percentile(sims, 90, axis=0)
+    # Volume momentum: check last vs mean
+    vol_mean = ind_df["volume"].tail(50).mean()
+    if row["volume"] > vol_mean * 1.5:
+        # high volume supports the direction of price move (use macd hist sign)
+        if row["macd_hist"] > 0:
+            votes["buy"] += 1
+        elif row["macd_hist"] < 0:
+            votes["sell"] += 1
 
-    # График
-    fig = plt.figure(figsize=(10,5), dpi=150)
-    ax = plt.gca()
+    # Final
+    score = votes["buy"] - votes["sell"]
+    if score >= 2:
+        recommendation = "BUY"
+    elif score <= -2:
+        recommendation = "SELL"
+    else:
+        recommendation = "HOLD"
 
-    # Свечной упрощённый (OHLC -> линии high/low+close)
-    dfc = df_1h.tail(24*7)  # последние 7 дней
-    t = range(len(dfc))
-    ax.plot(t, dfc["close"].values, label="Close (1h)")
-    # Индикаторы
-    dfi = compute_indicators(dfc)
-    ax.plot(t, dfi["ema50"].values, label="EMA50")
-    ax.plot(t, dfi["ema200"].values, label="EMA200")
-    # Диапазон симуляции
-    future_x = range(len(dfc), len(dfc)+steps+1)
-    ax.plot(future_x, median_path, linestyle="--", label="Sim median (24h)")
-    ax.fill_between(future_x, p10, p90, alpha=0.2, label="Sim P10–P90")
+    return recommendation, votes
 
-    ax.set_title(f"{symbol} — модель движения на 24ч (данные Bybit, 1h)")
-    ax.set_xlabel("Часы (последние 7 дней + 24ч вперёд)")
-    ax.set_ylabel("Цена (USDT)")
-    ax.legend(loc="best")
-    ax.grid(True, linestyle=":")
+# ------------------------------
+# Charting / simulation
+# ------------------------------
+def plot_price_and_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> bytes:
+    """
+    Create a multilayer chart with price and indicators and return PNG bytes.
+    """
+    plt.switch_backend('Agg')
+    fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True, gridspec_kw={'height_ratios':[3,1,1]})
+    ax_price, ax_macd, ax_rsi = axes
 
-    buf = io.BytesIO()
+    # Price plot with SMA/EMA and Bollinger bands
+    ax_price.plot(df.index, df["close"], label=f"{symbol} close")
+    if "sma20" in df.columns:
+        ax_price.plot(df.index, df["sma20"], label="SMA20", linewidth=0.8)
+    if "ema20" in df.columns:
+        ax_price.plot(df.index, df["ema20"], label="EMA20", linewidth=0.8)
+    if "bb_hband" in df.columns and "bb_lband" in df.columns:
+        ax_price.plot(df.index, df["bb_hband"], linestyle="--", linewidth=0.7, label="BB Upper")
+        ax_price.plot(df.index, df["bb_lband"], linestyle="--", linewidth=0.7, label="BB Lower")
+
+    ax_price.set_title(f"{symbol} {timeframe} — price & indicators")
+    ax_price.legend(loc="upper left")
+    ax_price.grid(True)
+
+    # MACD
+    if "macd_line" in df.columns:
+        ax_macd.plot(df.index, df["macd_line"], label="MACD")
+        ax_macd.plot(df.index, df["macd_signal"], label="Signal")
+        ax_macd.bar(df.index, df["macd_hist"], label="Hist", alpha=0.6)
+        ax_macd.legend(loc="upper left")
+        ax_macd.grid(True)
+
+    # RSI
+    if "rsi" in df.columns:
+        ax_rsi.plot(df.index, df["rsi"], label="RSI")
+        ax_rsi.axhline(70, color="red", linestyle="--", linewidth=0.6)
+        ax_rsi.axhline(30, color="green", linestyle="--", linewidth=0.6)
+        ax_rsi.legend(loc="upper left")
+        ax_rsi.grid(True)
+
     plt.tight_layout()
-    fig.savefig(buf, format="png")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
 
-def fmt_price(x: float) -> str:
-    if x >= 1: return f"{x:.4f}"
-    if x >= 0.1: return f"{x:.5f}"
-    return f"{x:.8f}"
+# ------------------------------
+# Report creation
+# ------------------------------
+def build_hourly_report(symbol: str) -> Tuple[str, bytes]:
+    """
+    For a symbol, compute indicators on multiple timeframes and create
+    a text report + PNG image (for the most relevant timeframe).
+    Return (text, image_bytes).
+    """
+    now = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    report_lines = [f"⏱ Hourly report for {symbol} — {now}\n"]
 
-async def build_report_for_symbol(symbol: str) -> str:
-    lines = [f"<b>{symbol}</b>"]
-    for tf_name, interval in TIMEFRAMES.items():
-        df = await bybit_klines(symbol, interval, limit=600)
-        dfi = compute_indicators(df)
-        fib = recent_swing_levels(dfi, lookback=250)
-        sups, ress = local_support_resistance(dfi, window=10, topn=3)
-        decision, reasons, row = signal_from_indicators(dfi)
+    # accumulate votes per timeframe
+    votes_summary = {}
+    last_imgs = None
 
-        atr = float(row.atr) if math.isfinite(row.atr) else None
-        sl, tp1, tp2 = (None, None, None)
-        if atr and decision in ("BUY","SELL"):
-            sl, tp1, tp2 = sl_tp_from_atr(decision, float(row.close), atr, sups, ress)
-
-        # Короткая строка по таймфрейму
-        fib_str = ""
-        if fib:
-            fib_str = f"Fibo 38.2%={fmt_price(fib['38.2%'])}, 61.8%={fmt_price(fib['61.8%'])}"
-        sr_str = ""
-        if sups or ress:
-            if sups: sr_str += "S:" + ",".join(fmt_price(x) for x in sups[:2])
-            if ress: sr_str += (" " if sr_str else "") + "R:" + ",".join(fmt_price(x) for x in ress[:2])
-
-        sltp = ""
-        if sl and tp1 and tp2:
-            sltp = f" | SL {fmt_price(sl)} / TP1 {fmt_price(tp1)} / TP2 {fmt_price(tp2)}"
-
-        lines.append(
-            f"• {tf_name}: {decision} @ {fmt_price(float(row.close))} | "
-            f"RSI {row.rsi:.1f} | MACD {'+' if row.macd_hist>0 else '-'} | BB [{fmt_price(float(row.bb_low))}…{fmt_price(float(row.bb_up))}] | {fib_str} | {sr_str}{sltp}"
-        )
-        # Добавим «почему»
-        if reasons:
-            lines.append("  └ причины: " + "; ".join(reasons[:3]))
-
-    return "\n".join(lines)
-
-async def hourly_job():
-    global LAST_REPORT_TEXT
-    parts = []
-    for sym in PAIRS:
+    for tf_label, tf_conf in TIMEFRAMES.items():
         try:
-            parts.append(await build_report_for_symbol(sym))
+            df = fetch_binance_klines(symbol, tf_conf["interval"], limit=tf_conf["limit"])
+            ind = compute_indicators(df)
+            rec, votes = score_signals(ind)
+            # support/resistance using last candle
+            last = df.tail(3)
+            last_candle = {"high": last["high"].iloc[-1], "low": last["low"].iloc[-1], "close": last["close"].iloc[-1]}
+            piv = pivot_support_resistance(last_candle)
+            # fib using last swing low/high (simple min/max of tail window)
+            window = df.tail(60)
+            low = float(window["low"].min())
+            high = float(window["high"].max())
+            fibs = fib_levels(low, high)
+
+            report_lines.append(f"TF: {tf_label} | Price: {df['close'].iloc[-1]:.6f} | Rec: {rec} | RSI:{ind['rsi'].iloc[-1]:.1f} | MACD_hist:{ind['macd_hist'].iloc[-1]:.6f}")
+            report_lines.append(f"  Pivot:{piv['pivot']:.6f}, R1:{piv['r1']:.6f}, S1:{piv['s1']:.6f}")
+            report_lines.append(f"  Fib 23.6%:{fibs['23.6%']:.6f} 38.2%:{fibs['38.2%']:.6f} 50%:{fibs['50.0%']:.6f}")
+            votes_summary[tf_label] = {"rec": rec, "votes": votes}
+
+            # keep image for highest timeframe (4h preferred) or last loop
+            if tf_label == "4h":
+                last_imgs = plot_price_and_indicators(ind.tail(200), symbol, tf_label)
+            elif last_imgs is None:
+                last_imgs = plot_price_and_indicators(ind.tail(200), symbol, tf_label)
         except Exception as e:
-            parts.append(f"{sym}: ошибка данных ({e})")
-    m2 = await fetch_m2_latest()
-    if m2:
-        parts.append(f"M2 (FRED): {m2['value']:.1f} млрд, дата {m2['date']}")
-    text = "📊 <b>Ежечасный отчёт</b>\n" + "\n\n".join(parts)
-    LAST_REPORT_TEXT = text
-    await telegram_send_text(text)
+            report_lines.append(f"TF: {tf_label} — error fetching or computing: {e}")
 
-async def daily_job_0400msk():
-    """Раз в сутки 04:00 МСК (01:00 UTC): 1) симуляции 2) краткий вывод по покупкам/продажам."""
-    global LAST_DAILY_IMAGE
-    for sym in PAIRS:
-        df_1h = await bybit_klines(sym, TIMEFRAMES["1h"], limit=800)
-        png = make_daily_simulation_chart(sym, df_1h)
-        LAST_DAILY_IMAGE[sym] = png
-        caption = f"{sym}: модель 24ч вперёд. Это НЕ финансовый совет."
-        await telegram_send_photo(png, caption)
+    # combine final recommendation by simple majority across timeframes
+    counts = {"BUY":0,"SELL":0,"HOLD":0}
+    for tf, data in votes_summary.items():
+        counts[data["rec"]] = counts.get(data["rec"], 0) + 1
+    final = max(counts.items(), key=lambda x: x[1])[0] if counts else "HOLD"
 
-    # Короткое резюме (по 1h)
-    parts = []
-    for sym in PAIRS:
-        dfi = compute_indicators(await bybit_klines(sym, TIMEFRAMES["1h"], limit=400))
-        dec, reasons, row = signal_from_indicators(dfi)
-        parts.append(f"{sym} 1h: {dec} @ {fmt_price(float(row.close))} — " + "; ".join(reasons[:3]))
-    msg = "🕓 04:00 МСК — дневной отчёт\n" + "\n".join(parts) + "\nM2 учитывается при наличии ключа."
-    await telegram_send_text(msg)
+    # Suggested SL/TP: simple ATR-like placeholder (use small percent)
+    try:
+        latest_price = float(fetch_binance_klines(symbol, "1h", limit=3)["close"].iloc[-1])
+        sl = latest_price * (0.98 if final=="BUY" else 1.02)  # 2% stop loss heuristic
+        tp = latest_price * (1.04 if final=="BUY" else 0.96)  # 4% take profit heuristic
+    except Exception:
+        sl = tp = None
 
-# -------------------- Планировщик --------------------
-scheduler = AsyncIOScheduler(timezone=APP_TZ)
-# Каждый час в ноль минут
-scheduler.add_job(hourly_job, CronTrigger(minute="0"))
-# Ежедневно в 01:00 UTC == 04:00 МСК
-scheduler.add_job(daily_job_0400msk, CronTrigger(hour="1", minute="0"))
+    header = f"Final recommendation for {symbol}: {final}\nSL: {sl:.6f} TP: {tp:.6f}\n"
+    text = header + "\n".join(report_lines)
+    return text, last_imgs
 
-@app.on_event("startup")
-async def on_startup():
-    scheduler.start()
+# ------------------------------
+# Telegram helpers (send text + image)
+# ------------------------------
+def telegram_send_text(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    try:
+        r = client.post(url, json=payload, timeout=15.0)
+        return r.status_code, r.text
+    except Exception as e:
+        print("Telegram send message error:", e)
+        return None
 
-# Локальный запуск для отладки
+def telegram_send_photo(image_bytes: bytes, caption: str = ""):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    files = {"photo": ("chart.png", image_bytes, "image/png")}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
+    try:
+        r = client.post(url, data=data, files=files, timeout=30.0)
+        return r.status_code, r.text
+    except Exception as e:
+        print("Telegram send photo error:", e)
+        return None
+
+# ------------------------------
+# Scheduler tasks
+# ------------------------------
+def hourly_task():
+    """
+    Runs each hour: fetch reports for configured symbols, send aggregated messages.
+    """
+    for sym in SYMBOLS:
+        try:
+            text, img = build_hourly_report(sym)
+            # Send text first (Telegram has limits), then image with caption summary
+            telegram_send_text(text[:4000])  # Telegram message size safe cut
+            if img:
+                caption = f"{sym} hourly chart (simulation)"
+                telegram_send_photo(img, caption=caption)
+            time.sleep(1.0)
+        except Exception as e:
+            print("Error in hourly_task for", sym, e)
+
+def daily_task():
+    """
+    Runs daily at 04:00 Moscow time. Sends a full daily report + simulation image for each symbol.
+    """
+    for sym in SYMBOLS:
+        try:
+            text, img = build_hourly_report(sym)  # reuse build function (multi-tf inside)
+            header = f"📈 DAILY REPORT (simulation) for {sym}\n"
+            telegram_send_text(header + text[:4000])
+            if img:
+                caption = f"{sym} daily simulation chart"
+                telegram_send_photo(img, caption=caption)
+            time.sleep(1.0)
+        except Exception as e:
+            print("Error in daily_task for", sym, e)
+
+# ------------------------------
+# Scheduler initialization
+# ------------------------------
+scheduler = BackgroundScheduler(timezone=SCHED_TZ)
+# At minute 1 each hour to avoid exact 00 collisions, or you can use minute=0.
+scheduler.add_job(hourly_task, "cron", minute=1)   # runs hourly at HH:01 Moscow time
+scheduler.add_job(daily_task, "cron", hour=4, minute=5)   # daily at 04:05 Moscow
+scheduler.start()
+
+# ------------------------------
+# FastAPI application (keep-alive)
+# ------------------------------
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "crypto-signal-bot running", "time": datetime.datetime.utcnow().isoformat()}
+
+# Optional health endpoint returning last run times (could be extended)
+@app.get("/health")
+def health():
+    return {"status": "ok", "tz": SCHED_TZ}
+
+# ------------------------------
+# Boot message + start server when main
+# ------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    # send startup message
+    try:
+        startup_text = "✅ Crypto signal bot deployed and running 24/7 (simulation charts)."
+        telegram_send_text(startup_text)
+    except Exception as e:
+        print("Startup telegram message failed:", e)
+    print(f"Starting uvicorn on 0.0.0.0:{PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
