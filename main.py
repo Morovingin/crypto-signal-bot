@@ -514,6 +514,11 @@ async def status():
     """Status endpoint for uptimerobot"""
     return {"status": "ok", "message": "Service is running"}
 
+@app.get("/ping")
+async def ping():
+    """Simple endpoint for uptimerobot monitoring"""
+    return Response(content="pong", media_type="text/plain")
+
 # ------------------------------
 # Graceful shutdown
 # ------------------------------
