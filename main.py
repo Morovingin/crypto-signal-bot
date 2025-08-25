@@ -11,7 +11,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from typing import Dict, List, Tuple
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # TA indicators from `ta` package
@@ -31,8 +31,7 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
 # Exchanges endpoints (public)
 BINANCE_KLINES_ENDPOINT = "https://api.binance.com/api/v3/klines"
-BYBIT_KLINES_ENDPOINT = "https://api.bybit.com/public/linear/kline"  # linear symbol (USDT)
-# Note: Bybit endpoint params differ; we'll use Binance for primary data and Bybit as optional
+BYBIT_KLINES_ENDPOINT = "https://api.bybit.com/public/linear/kline"
 
 SYMBOLS = ["DOGEUSDT", "ADAUSDT"]
 TIMEFRAMES = {
@@ -48,7 +47,7 @@ SCHED_TZ = "Europe/Moscow"
 # ------------------------------
 # Utilities: HTTP fetch
 # ------------------------------
-client = httpx.Client(timeout=20.0)
+client = httpx.Client(timeout=30.0)
 
 def fetch_binance_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     """
@@ -56,22 +55,26 @@ def fetch_binance_klines(symbol: str, interval: str, limit: int = 200) -> pd.Dat
     ['open_time','open','high','low','close','volume','close_time',...]
     All price columns are float and index is datetime of open_time.
     """
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    r = client.get(BINANCE_KLINES_ENDPOINT, params=params)
-    r.raise_for_status()
-    data = r.json()
-    if not data:
-        raise RuntimeError("Empty kline data")
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time","quote_asset_volume","num_trades",
-        "taker_buy_base_asset_volume","taker_buy_quote_asset_volume","ignore"
-    ])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df.set_index("open_time", inplace=True)
-    for col in ["open","high","low","close","volume"]:
-        df[col] = df[col].astype(float)
-    return df[["open","high","low","close","volume"]]
+    try:
+        params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+        r = client.get(BINANCE_KLINES_ENDPOINT, params=params)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            raise RuntimeError("Empty kline data")
+        df = pd.DataFrame(data, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time","quote_asset_volume","num_trades",
+            "taker_buy_base_asset_volume","taker_buy_quote_asset_volume","ignore"
+        ])
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.set_index("open_time", inplace=True)
+        for col in ["open","high","low","close","volume"]:
+            df[col] = df[col].astype(float)
+        return df[["open","high","low","close","volume"]]
+    except Exception as e:
+        print(f"Error fetching Binance data for {symbol}: {e}")
+        raise
 
 def fetch_bybit_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     """
@@ -79,40 +82,44 @@ def fetch_bybit_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataF
     interval here: "15", "60", "240", "720" (minutes) for Bybit.
     We'll map common intervals.
     """
-    mapping = {"15m":"15", "1h":"60", "4h":"240", "12h":"720"}
-    if interval not in mapping:
-        raise ValueError("Unsupported interval for Bybit")
-    params = {"symbol": symbol.upper(), "interval": mapping[interval], "limit": limit}
-    r = client.get(BYBIT_KLINES_ENDPOINT, params=params)
-    r.raise_for_status()
-    jd = r.json()
-    if "result" in jd and isinstance(jd["result"], list):
-        data = jd["result"]
-    elif "result" in jd and "list" in jd["result"]:
-        data = jd["result"]["list"]
-    else:
-        data = jd.get("result", [])
-    if not data:
-        raise RuntimeError("Empty bybit kline data")
-    df = pd.DataFrame(data)
-    # Bybit format may contain 'open_time' or 'start_at'(unix)
-    if "start_at" in df.columns:
-        df["open_time"] = pd.to_datetime(df["start_at"], unit="s")
-    elif "open_time" in df.columns:
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="s")
-    else:
-        # fallback: use 't' or first column
-        df["open_time"] = pd.to_datetime(df.iloc[:,0], unit="s")
-    df.set_index("open_time", inplace=True)
-    # Expected columns: open, high, low, close, volume
-    for col in ["open","high","low","close","volume"]:
-        if col in df.columns:
-            df[col] = df[col].astype(float)
-        elif col.capitalize() in df.columns:
-            df[col] = df[col.capitalize()].astype(float)
+    try:
+        mapping = {"15m":"15", "1h":"60", "4h":"240", "12h":"720"}
+        if interval not in mapping:
+            raise ValueError("Unsupported interval for Bybit")
+        params = {"symbol": symbol.upper(), "interval": mapping[interval], "limit": limit}
+        r = client.get(BYBIT_KLINES_ENDPOINT, params=params)
+        r.raise_for_status()
+        jd = r.json()
+        if "result" in jd and isinstance(jd["result"], list):
+            data = jd["result"]
+        elif "result" in jd and "list" in jd["result"]:
+            data = jd["result"]["list"]
         else:
-            df[col] = 0.0
-    return df[["open","high","low","close","volume"]]
+            data = jd.get("result", [])
+        if not data:
+            raise RuntimeError("Empty bybit kline data")
+        df = pd.DataFrame(data)
+        # Bybit format may contain 'open_time' or 'start_at'(unix)
+        if "start_at" in df.columns:
+            df["open_time"] = pd.to_datetime(df["start_at"], unit="s")
+        elif "open_time" in df.columns:
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="s")
+        else:
+            # fallback: use 't' or first column
+            df["open_time"] = pd.to_datetime(df.iloc[:,0], unit="s")
+        df.set_index("open_time", inplace=True)
+        # Expected columns: open, high, low, close, volume
+        for col in ["open","high","low","close","volume"]:
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+            elif col.capitalize() in df.columns:
+                df[col] = df[col.capitalize()].astype(float)
+            else:
+                df[col] = 0.0
+        return df[["open","high","low","close","volume"]]
+    except Exception as e:
+        print(f"Error fetching Bybit data for {symbol}: {e}")
+        raise
 
 # ------------------------------
 # Indicators calculation
@@ -126,39 +133,43 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
       - sma20, sma50, ema20, ema50
       - stoch_rsi_k, stoch_rsi_d
     """
-    out = df.copy()
-    close = out["close"]
+    try:
+        out = df.copy()
+        close = out["close"]
 
-    # RSI 14
-    rsi = RSIIndicator(close=close, window=14, fillna=True).rsi()
-    out["rsi"] = rsi
+        # RSI 14
+        rsi = RSIIndicator(close=close, window=14, fillna=True).rsi()
+        out["rsi"] = rsi
 
-    # MACD
-    macd = MACD(close=close, window_slow=26, window_fast=12, window_sign=9, fillna=True)
-    out["macd_line"] = macd.macd()
-    out["macd_signal"] = macd.macd_signal()
-    out["macd_hist"] = macd.macd_diff()
+        # MACD
+        macd = MACD(close=close, window_slow=26, window_fast=12, window_sign=9, fillna=True)
+        out["macd_line"] = macd.macd()
+        out["macd_signal"] = macd.macd_signal()
+        out["macd_hist"] = macd.macd_diff()
 
-    # Bollinger Bands (20, 2)
-    bb = BollingerBands(close=close, window=20, window_dev=2, fillna=True)
-    out["bb_mavg"] = bb.bollinger_mavg()
-    out["bb_hband"] = bb.bollinger_hband()
-    out["bb_lband"] = bb.bollinger_lband()
-    # position relative to bands
-    out["bb_pct"] = (close - out["bb_lband"]) / (out["bb_hband"] - out["bb_lband"] + 1e-12)
+        # Bollinger Bands (20, 2)
+        bb = BollingerBands(close=close, window=20, window_dev=2, fillna=True)
+        out["bb_mavg"] = bb.bollinger_mavg()
+        out["bb_hband"] = bb.bollinger_hband()
+        out["bb_lband"] = bb.bollinger_lband()
+        # position relative to bands
+        out["bb_pct"] = (close - out["bb_lband"]) / (out["bb_hband"] - out["bb_lband"] + 1e-12)
 
-    # SMA / EMA
-    out["sma20"] = SMAIndicator(close=close, window=20, fillna=True).sma_indicator()
-    out["sma50"] = SMAIndicator(close=close, window=50, fillna=True).sma_indicator()
-    out["ema20"] = EMAIndicator(close=close, window=20, fillna=True).ema_indicator()
-    out["ema50"] = EMAIndicator(close=close, window=50, fillna=True).ema_indicator()
+        # SMA / EMA
+        out["sma20"] = SMAIndicator(close=close, window=20, fillna=True).sma_indicator()
+        out["sma50"] = SMAIndicator(close=close, window=50, fillna=True).sma_indicator()
+        out["ema20"] = EMAIndicator(close=close, window=20, fillna=True).ema_indicator()
+        out["ema50"] = EMAIndicator(close=close, window=50, fillna=True).ema_indicator()
 
-    # Stochastic RSI
-    stoch_rsi = StochRSIIndicator(close=close, window=14, smooth1=3, smooth2=3, fillna=True)
-    out["stoch_rsi_k"] = stoch_rsi.stochrsi_k()
-    out["stoch_rsi_d"] = stoch_rsi.stochrsi_d()
+        # Stochastic RSI
+        stoch_rsi = StochRSIIndicator(close=close, window=14, smooth1=3, smooth2=3, fillna=True)
+        out["stoch_rsi_k"] = stoch_rsi.stochrsi_k()
+        out["stoch_rsi_d"] = stoch_rsi.stochrsi_d()
 
-    return out
+        return out
+    except Exception as e:
+        print(f"Error computing indicators: {e}")
+        raise
 
 # ------------------------------
 # Support / Resistance and Fib
@@ -171,28 +182,36 @@ def pivot_support_resistance(series: pd.Series) -> Dict[str, float]:
       S1 = 2*Pivot - High
     Return dict with pivot, r1, s1
     """
-    high = float(series["high"])
-    low = float(series["low"])
-    close = float(series["close"])
-    pivot = (high + low + close) / 3.0
-    r1 = 2*pivot - low
-    s1 = 2*pivot - high
-    return {"pivot": pivot, "r1": r1, "s1": s1}
+    try:
+        high = float(series["high"])
+        low = float(series["low"])
+        close = float(series["close"])
+        pivot = (high + low + close) / 3.0
+        r1 = 2*pivot - low
+        s1 = 2*pivot - high
+        return {"pivot": pivot, "r1": r1, "s1": s1}
+    except Exception as e:
+        print(f"Error calculating pivot: {e}")
+        return {"pivot": 0, "r1": 0, "s1": 0}
 
 def fib_levels(last_low: float, last_high: float) -> Dict[str, float]:
     """
     Return Fibonacci retracement levels between last_low and last_high
     """
-    diff = last_high - last_low
-    levels = {
-        "0.0%": last_high,
-        "23.6%": last_high - 0.236*diff,
-        "38.2%": last_high - 0.382*diff,
-        "50.0%": last_high - 0.5*diff,
-        "61.8%": last_high - 0.618*diff,
-        "100.0%": last_low
-    }
-    return levels
+    try:
+        diff = last_high - last_low
+        levels = {
+            "0.0%": last_high,
+            "23.6%": last_high - 0.236*diff,
+            "38.2%": last_high - 0.382*diff,
+            "50.0%": last_high - 0.5*diff,
+            "61.8%": last_high - 0.618*diff,
+            "100.0%": last_low
+        }
+        return levels
+    except Exception as e:
+        print(f"Error calculating Fibonacci levels: {e}")
+        return {}
 
 # ------------------------------
 # Signal logic (simple voting)
@@ -207,61 +226,65 @@ def score_signals(ind_df: pd.DataFrame) -> Tuple[str, Dict[str,int]]:
      - StochRSI: <0.2 buy, >0.8 sell
     Sum votes and return final recommendation and votes dict.
     """
-    row = ind_df.iloc[-1]
-    votes = {"buy": 0, "sell": 0, "neutral": 0}
-    price = row["close"]
+    try:
+        row = ind_df.iloc[-1]
+        votes = {"buy": 0, "sell": 0, "neutral": 0}
+        price = row["close"]
 
-    # RSI
-    if row["rsi"] < 30:
-        votes["buy"] += 1
-    elif row["rsi"] > 70:
-        votes["sell"] += 1
-    else:
-        votes["neutral"] += 0
+        # RSI
+        if row["rsi"] < 30:
+            votes["buy"] += 1
+        elif row["rsi"] > 70:
+            votes["sell"] += 1
+        else:
+            votes["neutral"] += 0
 
-    # MACD hist
-    if row["macd_hist"] > 0:
-        votes["buy"] += 1
-    elif row["macd_hist"] < 0:
-        votes["sell"] += 1
-
-    # EMA20 trend
-    if row["close"] > row["ema20"]:
-        votes["buy"] += 1
-    else:
-        votes["sell"] += 1
-
-    # Bollinger
-    if row["bb_pct"] > 0.85:
-        votes["sell"] += 1
-    elif row["bb_pct"] < 0.15:
-        votes["buy"] += 1
-
-    # Stoch RSI
-    if row["stoch_rsi_k"] < 20:
-        votes["buy"] += 1
-    elif row["stoch_rsi_k"] > 80:
-        votes["sell"] += 1
-
-    # Volume momentum: check last vs mean
-    vol_mean = ind_df["volume"].tail(50).mean()
-    if row["volume"] > vol_mean * 1.5:
-        # high volume supports the direction of price move (use macd hist sign)
+        # MACD hist
         if row["macd_hist"] > 0:
             votes["buy"] += 1
         elif row["macd_hist"] < 0:
             votes["sell"] += 1
 
-    # Final
-    score = votes["buy"] - votes["sell"]
-    if score >= 2:
-        recommendation = "BUY"
-    elif score <= -2:
-        recommendation = "SELL"
-    else:
-        recommendation = "HOLD"
+        # EMA20 trend
+        if row["close"] > row["ema20"]:
+            votes["buy"] += 1
+        else:
+            votes["sell"] += 1
 
-    return recommendation, votes
+        # Bollinger
+        if row["bb_pct"] > 0.85:
+            votes["sell"] += 1
+        elif row["bb_pct"] < 0.15:
+            votes["buy"] += 1
+
+        # Stoch RSI
+        if row["stoch_rsi_k"] < 20:
+            votes["buy"] += 1
+        elif row["stoch_rsi_k"] > 80:
+            votes["sell"] += 1
+
+        # Volume momentum: check last vs mean
+        vol_mean = ind_df["volume"].tail(50).mean()
+        if row["volume"] > vol_mean * 1.5:
+            # high volume supports the direction of price move (use macd hist sign)
+            if row["macd_hist"] > 0:
+                votes["buy"] += 1
+            elif row["macd_hist"] < 0:
+                votes["sell"] += 1
+
+        # Final
+        score = votes["buy"] - votes["sell"]
+        if score >= 2:
+            recommendation = "BUY"
+        elif score <= -2:
+            recommendation = "SELL"
+        else:
+            recommendation = "HOLD"
+
+        return recommendation, votes
+    except Exception as e:
+        print(f"Error scoring signals: {e}")
+        return "HOLD", {"buy": 0, "sell": 0, "neutral": 0}
 
 # ------------------------------
 # Charting / simulation
@@ -270,46 +293,51 @@ def plot_price_and_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> 
     """
     Create a multilayer chart with price and indicators and return PNG bytes.
     """
-    plt.switch_backend('Agg')
-    fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True, gridspec_kw={'height_ratios':[3,1,1]})
-    ax_price, ax_macd, ax_rsi = axes
+    try:
+        plt.switch_backend('Agg')
+        fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True, gridspec_kw={'height_ratios':[3,1,1]})
+        ax_price, ax_macd, ax_rsi = axes
 
-    # Price plot with SMA/EMA and Bollinger bands
-    ax_price.plot(df.index, df["close"], label=f"{symbol} close")
-    if "sma20" in df.columns:
-        ax_price.plot(df.index, df["sma20"], label="SMA20", linewidth=0.8)
-    if "ema20" in df.columns:
-        ax_price.plot(df.index, df["ema20"], label="EMA20", linewidth=0.8)
-    if "bb_hband" in df.columns and "bb_lband" in df.columns:
-        ax_price.plot(df.index, df["bb_hband"], linestyle="--", linewidth=0.7, label="BB Upper")
-        ax_price.plot(df.index, df["bb_lband"], linestyle="--", linewidth=0.7, label="BB Lower")
+        # Price plot with SMA/EMA and Bollinger bands
+        ax_price.plot(df.index, df["close"], label=f"{symbol} close")
+        if "sma20" in df.columns:
+            ax_price.plot(df.index, df["sma20"], label="SMA20", linewidth=0.8)
+        if "ema20" in df.columns:
+            ax_price.plot(df.index, df["ema20"], label="EMA20", linewidth=0.8)
+        if "bb_hband" in df.columns and "bb_lband" in df.columns:
+            ax_price.plot(df.index, df["bb_hband"], linestyle="--", linewidth=0.7, label="BB Upper")
+            ax_price.plot(df.index, df["bb_lband"], linestyle="--", linewidth=0.7, label="BB Lower")
 
-    ax_price.set_title(f"{symbol} {timeframe} — price & indicators")
-    ax_price.legend(loc="upper left")
-    ax_price.grid(True)
+        ax_price.set_title(f"{symbol} {timeframe} — price & indicators")
+        ax_price.legend(loc="upper left")
+        ax_price.grid(True)
 
-    # MACD
-    if "macd_line" in df.columns:
-        ax_macd.plot(df.index, df["macd_line"], label="MACD")
-        ax_macd.plot(df.index, df["macd_signal"], label="Signal")
-        ax_macd.bar(df.index, df["macd_hist"], label="Hist", alpha=0.6)
-        ax_macd.legend(loc="upper left")
-        ax_macd.grid(True)
+        # MACD
+        if "macd_line" in df.columns:
+            ax_macd.plot(df.index, df["macd_line"], label="MACD")
+            ax_macd.plot(df.index, df["macd_signal"], label="Signal")
+            ax_macd.bar(df.index, df["macd_hist"], label="Hist", alpha=0.6)
+            ax_macd.legend(loc="upper left")
+            ax_macd.grid(True)
 
-    # RSI
-    if "rsi" in df.columns:
-        ax_rsi.plot(df.index, df["rsi"], label="RSI")
-        ax_rsi.axhline(70, color="red", linestyle="--", linewidth=0.6)
-        ax_rsi.axhline(30, color="green", linestyle="--", linewidth=0.6)
-        ax_rsi.legend(loc="upper left")
-        ax_rsi.grid(True)
+        # RSI
+        if "rsi" in df.columns:
+            ax_rsi.plot(df.index, df["rsi"], label="RSI")
+            ax_rsi.axhline(70, color="red", linestyle="--", linewidth=0.6)
+            ax_rsi.axhline(30, color="green", linestyle="--", linewidth=0.6)
+            ax_rsi.legend(loc="upper left")
+            ax_rsi.grid(True)
 
-    plt.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
+        plt.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"Error creating chart: {e}")
+        # Return empty bytes if chart creation fails
+        return b""
 
 # ------------------------------
 # Report creation
@@ -367,7 +395,7 @@ def build_hourly_report(symbol: str) -> Tuple[str, bytes]:
         sl = latest_price * (0.98 if final=="BUY" else 1.02)  # 2% stop loss heuristic
         tp = latest_price * (1.04 if final=="BUY" else 0.96)  # 4% take profit heuristic
     except Exception:
-        sl = tp = None
+        sl = tp = 0.0
 
     header = f"Final recommendation for {symbol}: {final}\nSL: {sl:.6f} TP: {tp:.6f}\n"
     text = header + "\n".join(report_lines)
@@ -377,25 +405,30 @@ def build_hourly_report(symbol: str) -> Tuple[str, bytes]:
 # Telegram helpers (send text + image)
 # ------------------------------
 def telegram_send_text(text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    """Send text message to Telegram"""
     try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
         r = client.post(url, json=payload, timeout=15.0)
         return r.status_code, r.text
     except Exception as e:
         print("Telegram send message error:", e)
-        return None
+        return None, str(e)
 
 def telegram_send_photo(image_bytes: bytes, caption: str = ""):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("chart.png", image_bytes, "image/png")}
-    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
+    """Send photo to Telegram"""
     try:
+        if not image_bytes:
+            return None, "Empty image"
+            
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        files = {"photo": ("chart.png", image_bytes, "image/png")}
+        data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
         r = client.post(url, data=data, files=files, timeout=30.0)
         return r.status_code, r.text
     except Exception as e:
         print("Telegram send photo error:", e)
-        return None
+        return None, str(e)
 
 # ------------------------------
 # Scheduler tasks
@@ -438,22 +471,56 @@ def daily_task():
 scheduler = BackgroundScheduler(timezone=SCHED_TZ)
 # At minute 1 each hour to avoid exact 00 collisions, or you can use minute=0.
 scheduler.add_job(hourly_task, "cron", minute=1)   # runs hourly at HH:01 Moscow time
-scheduler.add_job(daily_task, "cron", hour=4, minute=5)   # daily at 04:05 Moscow
+scheduler.add_job(daily_task, "cron", hour=4, minute=2)   # daily at 04:02 Moscow
 scheduler.start()
 
 # ------------------------------
 # FastAPI application (keep-alive)
 # ------------------------------
-app = FastAPI()
+app = FastAPI(title="Crypto Signal Bot")
 
 @app.get("/")
-def root():
-    return {"status": "crypto-signal-bot running", "time": datetime.datetime.utcnow().isoformat()}
+async def root():
+    return {
+        "status": "crypto-signal-bot running", 
+        "time": datetime.datetime.utcnow().isoformat(),
+        "service": "crypto-signal-bot"
+    }
 
-# Optional health endpoint returning last run times (could be extended)
 @app.get("/health")
-def health():
-    return {"status": "ok", "tz": SCHED_TZ}
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Test Binance API connectivity
+        test_df = fetch_binance_klines("BTCUSDT", "1m", 1)
+        return {
+            "status": "healthy",
+            "binance_api": "available",
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        return Response(
+            content=json.dumps({
+                "status": "unhealthy",
+                "error": str(e),
+                "timestamp": datetime.datetime.utcnow().isoformat()
+            }),
+            status_code=500,
+            media_type="application/json"
+        )
+
+@app.get("/status")
+async def status():
+    """Status endpoint for uptimerobot"""
+    return {"status": "ok", "message": "Service is running"}
+
+# ------------------------------
+# Graceful shutdown
+# ------------------------------
+import atexit
+@atexit.register
+def shutdown_scheduler():
+    scheduler.shutdown()
 
 # ------------------------------
 # Boot message + start server when main
@@ -467,4 +534,9 @@ if __name__ == "__main__":
     except Exception as e:
         print("Startup telegram message failed:", e)
     print(f"Starting uvicorn on 0.0.0.0:{PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=PORT,
+        timeout_keep_alive=300
+    )
