@@ -384,10 +384,9 @@ scheduler.start()
 app = FastAPI(title="Crypto Signal Bot")
 
 # allow both GET and HEAD explicitly to avoid 405 from monitors that use HEAD
-@app.get("/", methods=["GET", "HEAD"])
+@app.api_route("/", methods=["HEAD", "GET"])
 async def root():
-    return {
-        "status": "crypto-signal-bot running",
+    return {"status": "Bot is running"},
         "time": datetime.datetime.utcnow().isoformat(),
         "service": "crypto-signal-bot"
     }
