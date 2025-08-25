@@ -20,12 +20,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # === Init ===
-bot = Bot(token=TELEGRAM_TOKEN)
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 app = FastAPI()
 scheduler = AsyncIOScheduler()
 
 # === Telegram bot with handlers ===
-tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 # === SYMBOLS TO TRACK ===
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOGEUSDT"]
