@@ -9,4 +9,4 @@ numpy==1.26.4
 python-dotenv==1.0.1
 pytz==2024.1
 yfinance==0.2.22
-tvdatafeed
+git+https://github.com/StreamAlpha/tvdatafeed.git
