@@ -1,55 +1,55 @@
 # main.py
 """
-Robust crypto signal bot:
-- async httpx client
-- Bybit v5 + Binance kline fetch with fallback
-- local pickle cache to avoid "No data" reports
-- indicators and plotting
-- AsyncIOScheduler: hourly (minute=0), daily (04:00), weekly (Sun 06:00)
-- Telegram webhook endpoint (/telegram_webhook) and HTTP /fast preview endpoint
+Async crypto-signal bot (main.py)
+- Async httpx client
+- AsyncIOScheduler (jobs run at minute=0)
+- /telegram_webhook endpoint (accepts commands: /fast, /temp, /report)
+- /fast HTTP endpoint for quick preview
+- root accepts GET and HEAD (fixes UptimeRobot 405)
+- Uses compute_indicators()/plot/... from TA libs
 """
+
 import os
 import io
-import asyncio
-import time
 import json
 import logging
 import datetime
-import traceback
+import asyncio
 from typing import Dict, Tuple, Optional
 
 import httpx
 import pandas as pd
-import numpy as np
 
-# avoid matplotlib font cache permission issues
+# avoid matplotlib font cache permission problems
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import matplotlib.pyplot as plt
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# TA
+# TA indicators
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.trend import MACD, SMAIndicator, EMAIndicator
 from ta.volatility import BollingerBands
 
 # ------------------------------
-# Logging
+# Logging (DEBUG for troubleshooting)
 # ------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.DEBUG,
+)
 logger = logging.getLogger("crypto-signal-bot")
 
 # ------------------------------
-# Config / env
+# Config
 # ------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", "10000"))
-EXCHANGE = os.getenv("EXCHANGE", "BYBIT").upper()  # BYBIT or BINANCE
+EXCHANGE = os.getenv("EXCHANGE", "BYBIT").upper()
 SCHED_TZ = os.getenv("SCHED_TZ", "Europe/Moscow")
-SYMBOLS = os.getenv("SYMBOLS", "DOGEUSDT,ADAUSDT,XRPUSDT").split(",")
+SYMBOLS = os.getenv("SYMBOLS", "DOGEUSDT,ADAUSDT").split(",")
 TIMEFRAMES = {
     "15m": {"interval": "15m", "limit": 200},
     "1h": {"interval": "1h", "limit": 200},
@@ -58,53 +58,27 @@ TIMEFRAMES = {
 }
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set - telegram notifications will be skipped")
-
-# endpoints
-BINANCE_KLINES_ENDPOINT = "https://api.binance.com/api/v3/klines"
-BYBIT_KLINES_V5 = "https://api.bybit.com/v5/market/kline"
-
-# cache dir (pickle)
-CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/klines_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-# httpx async client
-HEADERS = {"User-Agent": "crypto-signal-bot/1.0"}
-client = httpx.AsyncClient(timeout=20.0, headers=HEADERS)
+    logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set - telegram will be disabled for sending reports")
 
 # ------------------------------
-# Cache helpers
+# Async HTTP client (shared)
 # ------------------------------
-def _cache_path(symbol: str, tf_label: str) -> str:
-    safe = symbol.replace("/", "_")
-    return os.path.join(CACHE_DIR, f"{safe}__{tf_label}.pkl")
-
-def save_cache(df: pd.DataFrame, symbol: str, tf_label: str) -> None:
-    try:
-        path = _cache_path(symbol, tf_label)
-        df.to_pickle(path)
-        logger.info("Saved cache %s (%d rows)", path, len(df))
-    except Exception:
-        logger.exception("Failed to save cache for %s %s", symbol, tf_label)
-
-def load_cache(symbol: str, tf_label: str) -> Optional[pd.DataFrame]:
-    try:
-        path = _cache_path(symbol, tf_label)
-        if not os.path.exists(path):
-            return None
-        df = pd.read_pickle(path)
-        logger.info("Loaded cache %s (%d rows)", path, len(df))
-        return df
-    except Exception:
-        logger.exception("Failed to load cache for %s %s", symbol, tf_label)
-        return None
+HEADERS = {"User-Agent": "crypto-signal-bot/1.0 (+https://example.com)"}
+client = httpx.AsyncClient(timeout=30.0, headers=HEADERS)
 
 # ------------------------------
-# Fetching klines (async) - Bybit v5 + Binance
+# Endpoints (sync strings)
+# ------------------------------
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BYBIT_KLINES_URL = "https://api.bybit.com/v5/market/kline"
+
+# ------------------------------
+# Helpers: fetch klines (async)
 # ------------------------------
 async def fetch_binance_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    r = await client.get(BINANCE_KLINES_ENDPOINT, params=params)
+    logger.debug("fetch_binance_klines: %s %s", symbol, interval)
+    r = await client.get(BINANCE_KLINES_URL, params=params)
     r.raise_for_status()
     data = r.json()
     if not data:
@@ -116,31 +90,30 @@ async def fetch_binance_klines(symbol: str, interval: str, limit: int = 200) -> 
     ])
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df.set_index("open_time", inplace=True)
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
     return df[["open","high","low","close","volume"]]
 
-async def fetch_bybit_v5_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+async def fetch_bybit_klines_v5(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     mapping = {"15m":"15", "1h":"60", "4h":"240", "12h":"720"}
     if interval not in mapping:
         raise ValueError("Unsupported interval for Bybit: " + interval)
-    params = {"category":"linear", "symbol": symbol.upper(), "interval": mapping[interval], "limit": limit}
-    r = await client.get(BYBIT_KLINES_V5, params=params)
+    params = {"category": "linear", "symbol": symbol.upper(), "interval": mapping[interval], "limit": limit}
+    logger.debug("fetch_bybit_klines_v5: %s %s", symbol, interval)
+    r = await client.get(BYBIT_KLINES_URL, params=params)
     r.raise_for_status()
     jd = r.json()
     data = []
     if isinstance(jd, dict):
         res = jd.get("result")
-        # result could be dict with "list" or list directly
         if isinstance(res, dict) and "list" in res:
             data = res["list"]
         elif isinstance(res, list):
             data = res
     if not data:
-        # sometimes older endpoints use "ret_code" naming - include whole response for debug
-        raise RuntimeError("Empty bybit v5 data: " + json.dumps(jd)[:400])
+        raise RuntimeError("Empty bybit v5 data: " + json.dumps(jd)[:500])
     df = pd.DataFrame(data)
-    # bybit fields: start or start_at (seconds)
+    # bybit: 'start' is seconds
     if "start" in df.columns:
         df["open_time"] = pd.to_datetime(df["start"], unit="s")
     elif "start_at" in df.columns:
@@ -161,39 +134,27 @@ async def fetch_bybit_v5_klines(symbol: str, interval: str, limit: int = 200) ->
     return df[["open","high","low","close","volume"]]
 
 async def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    """Try preferred exchange then fallback, use cache if both fail."""
+    """Try preferred exchange first, fallback to the other"""
     last_exc = None
-    order = ["BYBIT","BINANCE"] if EXCHANGE == "BYBIT" else ["BINANCE","BYBIT"]
+    order = ["BYBIT", "BINANCE"] if EXCHANGE == "BYBIT" else ["BINANCE", "BYBIT"]
     for exch in order:
         try:
             if exch == "BYBIT":
-                df = await fetch_bybit_v5_klines(symbol, interval, limit=limit)
+                df = await fetch_bybit_klines_v5(symbol, interval, limit=limit)
             else:
                 df = await fetch_binance_klines(symbol, interval, limit=limit)
             if df is None or df.empty:
                 raise RuntimeError(f"Empty data from {exch}")
-            # save cache
-            try:
-                save_cache(df, symbol, interval)
-            except Exception:
-                logger.exception("save_cache failed")
             return df
         except httpx.HTTPStatusError as he:
+            logger.warning("fetch_klines %s failed on %s: %s", symbol, exch, he)
             last_exc = he
-            status = he.response.status_code if he.response is not None else None
-            logger.warning("fetch_klines %s failed for %s %s: %s", exch, symbol, interval, str(he))
             continue
         except Exception as e:
+            logger.exception("fetch_klines error from %s for %s %s", exch, symbol, interval)
             last_exc = e
-            logger.warning("fetch_klines error from %s for %s %s : %s", exch, symbol, interval, str(e))
             continue
-
-    # both failed -> try cache
-    logger.error("All exchanges failed for %s %s. Trying cache. last_exc=%s", symbol, interval, last_exc)
-    cached = load_cache(symbol, interval)
-    if cached is not None and not cached.empty:
-        logger.info("Using cached data for %s %s", symbol, interval)
-        return cached
+    # both failed
     raise RuntimeError(f"Bybit/Binance fetch failed for {symbol} {interval}. Last error: {last_exc}")
 
 # ------------------------------
@@ -227,7 +188,9 @@ def pivot_support_resistance(series: Dict[str, float]) -> Dict[str, float]:
         low = float(series["low"])
         close = float(series["close"])
         pivot = (high + low + close) / 3.0
-        return {"pivot": pivot, "r1": 2*pivot - low, "s1": 2*pivot - high}
+        r1 = 2 * pivot - low
+        s1 = 2 * pivot - high
+        return {"pivot": pivot, "r1": r1, "s1": s1}
     except Exception:
         return {"pivot": 0.0, "r1": 0.0, "s1": 0.0}
 
@@ -271,7 +234,7 @@ def score_signals(ind_df: pd.DataFrame) -> Tuple[str, Dict[str,int]]:
 def plot_price_and_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> bytes:
     try:
         plt.switch_backend("Agg")
-        fig, axes = plt.subplots(3,1, figsize=(11,10), sharex=True, gridspec_kw={"height_ratios":[3,1,1]})
+        fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True, gridspec_kw={"height_ratios":[3,1,1]})
         ax_price, ax_macd, ax_rsi = axes
         ax_price.plot(df.index, df["close"], label=f"{symbol} close")
         if "sma20" in df.columns: ax_price.plot(df.index, df["sma20"], label="SMA20", linewidth=0.8)
@@ -293,7 +256,7 @@ def plot_price_and_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> 
             ax_rsi.legend(loc="upper left"); ax_rsi.grid(True)
         plt.tight_layout()
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=120)
+        fig.savefig(buf, format="png", dpi=130)
         plt.close(fig)
         buf.seek(0)
         return buf.read()
@@ -302,7 +265,7 @@ def plot_price_and_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> 
         return b""
 
 # ------------------------------
-# Build report (async)
+# Build hourly report (async)
 # ------------------------------
 async def build_hourly_report(symbol: str) -> Tuple[str, bytes]:
     now = datetime.datetime.datetime.utcnow().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -321,9 +284,10 @@ async def build_hourly_report(symbol: str) -> Tuple[str, bytes]:
             lastc = {"high": last["high"].iloc[-1], "low": last["low"].iloc[-1], "close": last["close"].iloc[-1]}
             piv = pivot_support_resistance(lastc)
             window = df.tail(60)
-            low = float(window["low"].min()); high = float(window["high"].max())
+            low = float(window["low"].min())
+            high = float(window["high"].max())
             fibs = fib_levels(low, high)
-            lines.append(f"TF: {tf_label} | Price: {df['close'].iloc[-1]:.8f} | Rec: {rec} | RSI:{ind['rsi'].iloc[-1]:.1f}")
+            lines.append(f"TF: {tf_label} | Price: {df['close'].iloc[-1]:.8f} | Rec: {rec} | RSI:{ind['rsi'].iloc[-1]:.1f} | MACD_hist:{ind['macd_hist'].iloc[-1]:.6f}")
             lines.append(f"  Pivot:{piv['pivot']:.8f}, R1:{piv['r1']:.8f}, S1:{piv['s1']:.8f}")
             lines.append(f"  Fib 23.6%:{fibs['23.6%']:.8f} 38.2%:{fibs['38.2%']:.8f} 50%:{fibs['50.0%']:.8f}")
             votes_summary[tf_label] = {"rec": rec, "votes": votes}
@@ -332,63 +296,63 @@ async def build_hourly_report(symbol: str) -> Tuple[str, bytes]:
             elif not chosen_image:
                 chosen_image = plot_price_and_indicators(ind.tail(200), symbol, tf_label)
         except Exception as e:
-            tb = traceback.format_exc()
-            logger.exception("build_hourly_report error for %s %s", symbol, tf_label)
-            lines.append(f"TF: {tf_label} — error computing data: {str(e)}")
-            lines.append(f"Debug: {tb.splitlines()[-1]}")
-    # aggregate
+            logger.exception("build_hourly_report: error for %s %s", symbol, tf_label)
+            lines.append(f"TF: {tf_label} — error computing data: {e}")
+    # aggregate final
     counts = {"BUY":0,"SELL":0,"HOLD":0}
     for tf, d in votes_summary.items():
         counts[d["rec"]] = counts.get(d["rec"], 0) + 1
     final = max(counts.items(), key=lambda x: x[1])[0] if counts else "HOLD"
-    # SL/TP
+    # SL/TP heuristic
     sl = tp = None
     try:
         latest_df = await fetch_klines(symbol, "1h", limit=3)
         latest_price = float(latest_df["close"].iloc[-1])
         if final == "BUY":
-            sl = latest_price * 0.98; tp = latest_price * 1.04
+            sl = latest_price * 0.98
+            tp = latest_price * 1.04
         elif final == "SELL":
-            sl = latest_price * 1.02; tp = latest_price * 0.96
-    except Exception as e:
-        logger.warning("SL/TP calc failed for %s: %s", symbol, e)
+            sl = latest_price * 1.02
+            tp = latest_price * 0.96
+    except Exception:
+        logger.warning("SL/TP calc failed for %s", symbol)
         sl = tp = None
-    header = f"Final recommendation for {symbol}: {final}\nSL: {('n/a' if sl is None else f'{sl:.8f}')} TP: {('n/a' if tp is None else f'{tp:.8f}')}\n"
+    header = f"Final recommendation for {symbol}: {final}\nSL: {sl if sl else 'n/a'} TP: {tp if tp else 'n/a'}\n"
     text = header + "\n".join(lines)
     return text, chosen_image
 
 # ------------------------------
 # Telegram helpers (async HTTP)
 # ------------------------------
-async def telegram_send_text(text: str, chat_id: Optional[str] = None) -> Tuple[Optional[int], str]:
+async def telegram_send_text(chat_id: str, text: str) -> Tuple[Optional[int], str]:
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("telegram_send_text skipped: missing token")
         return None, "missing token"
-    if chat_id is None: chat_id = TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     try:
-        r = await client.post(url, json=payload, timeout=20.0)
+        r = await client.post(url, json=payload)
         r.raise_for_status()
+        logger.debug("telegram_send_text OK chat=%s len=%s", chat_id, len(text))
         return r.status_code, r.text
     except Exception:
         logger.exception("telegram_send_text failed")
         return None, "error"
 
-async def telegram_send_photo(image_bytes: bytes, caption: str = "", chat_id: Optional[str] = None) -> Tuple[Optional[int], str]:
+async def telegram_send_photo(chat_id: str, image_bytes: bytes, caption: str = "") -> Tuple[Optional[int], str]:
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("telegram_send_photo skipped: missing token")
         return None, "missing token"
-    if chat_id is None: chat_id = TELEGRAM_CHAT_ID
     if not image_bytes:
         logger.warning("telegram_send_photo skipped: empty image")
         return None, "empty image"
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {"photo": ("chart.png", image_bytes, "image/png")}
-    data = {"chat_id": str(chat_id), "caption": caption}
+    data = {"chat_id": chat_id, "caption": caption}
     try:
-        r = await client.post(url, data=data, files=files, timeout=30.0)
+        r = await client.post(url, data=data, files=files)
         r.raise_for_status()
+        logger.debug("telegram_send_photo OK chat=%s size=%s", chat_id, len(image_bytes))
         return r.status_code, r.text
     except Exception:
         logger.exception("telegram_send_photo failed")
@@ -403,11 +367,11 @@ async def hourly_task():
         try:
             text, img = await build_hourly_report(sym)
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                await telegram_send_text(text[:3800])
+                await telegram_send_text(TELEGRAM_CHAT_ID, text[:3800])
                 if img:
-                    await telegram_send_photo(img, caption=f"{sym} hourly chart")
+                    await telegram_send_photo(TELEGRAM_CHAT_ID, img, caption=f"{sym} hourly")
             else:
-                logger.info("Report for %s:\n%s", sym, text[:800])
+                logger.info("Report for %s:\n%s", sym, text[:600])
             await asyncio.sleep(0.5)
         except Exception:
             logger.exception("hourly_task error for %s", sym)
@@ -419,145 +383,165 @@ async def daily_task():
         try:
             text, img = await build_hourly_report(sym)
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                await telegram_send_text("📈 DAILY REPORT\n" + text[:3800])
+                await telegram_send_text(TELEGRAM_CHAT_ID, "📈 DAILY REPORT\n" + text[:3800])
                 if img:
-                    await telegram_send_photo(img, caption=f"{sym} daily chart")
+                    await telegram_send_photo(TELEGRAM_CHAT_ID, img, caption=f"{sym} daily")
             await asyncio.sleep(0.5)
         except Exception:
             logger.exception("daily_task error for %s", sym)
     logger.info("Daily task finished")
 
-async def weekly_task():
-    logger.info("Weekly task started")
-    for sym in SYMBOLS:
-        try:
-            # weekly report uses 1w timeframe if user wants; for now use aggregated daily/weekly logic
-            text, img = await build_hourly_report(sym)
-            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                await telegram_send_text("🗓 WEEKLY REPORT\n" + text[:3800])
-                if img:
-                    await telegram_send_photo(img, caption=f"{sym} weekly chart")
-            await asyncio.sleep(0.5)
-        except Exception:
-            logger.exception("weekly_task error for %s", sym)
-    logger.info("Weekly task finished")
-
 # ------------------------------
-# Scheduler (AsyncIOScheduler)
+# Scheduler (use AsyncIOScheduler, exact hour minute=0)
 # ------------------------------
 scheduler = AsyncIOScheduler(timezone=SCHED_TZ)
-# hourly at minute=0
-scheduler.add_job(hourly_task, "cron", minute=0, id="hourly_task")
-# daily at 04:00
-scheduler.add_job(daily_task, "cron", hour=4, minute=0, id="daily_task")
-# weekly: Sunday at 06:00
-scheduler.add_job(weekly_task, "cron", day_of_week="sun", hour=6, minute=0, id="weekly_task")
+# schedule coroutine functions directly; AsyncIOScheduler will handle them
+scheduler.add_job(lambda: asyncio.create_task(hourly_task()), "cron", minute=0, id="hourly_task", coalesce=True)
+scheduler.add_job(lambda: asyncio.create_task(daily_task()), "cron", hour=4, minute=0, id="daily_task", coalesce=True)
 
 # ------------------------------
-# FastAPI app & webhook
+# FastAPI app
 # ------------------------------
-app = FastAPI(title="crypto-signal-bot")
+app = FastAPI(title="Crypto Signal Bot")
 
-@app.on_event("startup")
-async def on_startup():
-    try:
-        if not scheduler.running:
-            scheduler.start()
-            logger.info("Scheduler started")
-    except Exception:
-        logger.exception("Failed to start scheduler")
-    # startup message best effort
-    try:
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            await telegram_send_text("✅ Crypto signal bot started (hourly reports at :00).")
-    except Exception:
-        logger.exception("startup message failed")
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    try:
-        if scheduler.running:
-            scheduler.shutdown(wait=False)
-            logger.info("Scheduler stopped")
-    except Exception:
-        logger.exception("scheduler shutdown failed")
-    try:
-        await client.aclose()
-    except Exception:
-        logger.exception("client close failed")
-
-@app.get("/")
+# root supports GET and HEAD (fixes 405 from uptime monitors)
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"status":"running","time": datetime.datetime.utcnow().isoformat(), "exchange": EXCHANGE}
+    return {
+        "status": "crypto-signal-bot running",
+        "time": datetime.datetime.datetime.utcnow().isoformat(),
+        "exchange": EXCHANGE
+    }
 
-@app.get("/fast")
-async def http_fast_preview():
-    """Return short preview for each symbol — useful for testing / uptime monitors."""
+@app.get("/health")
+async def health():
     try:
-        out = {}
-        for sym in SYMBOLS:
-            txt, _ = await build_hourly_report(sym)
-            out[sym] = txt.splitlines()[:8]
-        return {"ok": True, "preview": out}
+        df = await fetch_klines(SYMBOLS[0], "1h", limit=2)
+        ok = bool(df is not None and not df.empty)
+        return {"status": "healthy" if ok else "unhealthy", "exchange": EXCHANGE}
     except Exception as e:
-        logger.exception("http_fast failed")
-        return JSONResponse(content={"ok": False, "error": str(e)}, status_code=500)
+        logger.exception("health failed")
+        return Response(content=json.dumps({"status": "unhealthy", "error": str(e)}), media_type="application/json", status_code=500)
 
+@app.get("/status")
+async def status():
+    return {"status": "ok", "message": "Service is running"}
+
+@app.get("/ping")
+async def ping():
+    return Response(content="pong", media_type="text/plain")
+
+# ------------------------------
+# Telegram webhook endpoint (single path, easier for webhook setup)
+# ------------------------------
 @app.post("/telegram_webhook")
 async def telegram_webhook(request: Request):
-    """Webhook handler for Telegram updates.
-    Supported commands (from user chat): /fast, /temp, /report SYMBOL
+    """
+    Incoming Telegram webhook. Accepts commands:
+      /fast  - generate immediate reports for configured SYMBOLS
+      /temp  - quick preview (alias)
+      /report <SYMBOL> - single symbol report
     """
     try:
         upd = await request.json()
     except Exception:
+        logger.exception("telegram_webhook: invalid json")
         return {"ok": False, "error": "invalid json"}
     message = upd.get("message") or upd.get("edited_message")
     if not message:
         return {"ok": True}
     chat = message.get("chat", {})
     chat_id = chat.get("id")
-    text = (message.get("text") or "").strip()
+    text = message.get("text", "") or ""
+    text = text.strip()
     if not text:
         return {"ok": True}
     parts = text.split()
-    cmd = parts[0].lstrip("/").split("@")[0].lower()
+    cmd = parts[0].lstrip("/").lower()
     args = parts[1:]
-    logger.info("Received webhook cmd=%s args=%s chat=%s", cmd, args, chat_id)
+    logger.info("Received webhook cmd=%s args=%s from chat=%s", cmd, args, chat_id)
     try:
-        if cmd in ("fast", "test", "run"):
-            # send immediate reports for all symbols
+        if cmd in ("fast", "temp"):
+            # immediate report for all configured symbols
             for sym in SYMBOLS:
                 rpt, img = await build_hourly_report(sym)
-                await telegram_send_text(rpt[:3800], chat_id=chat_id)
+                await telegram_send_text(chat_id, rpt[:3800])
                 if img:
-                    await telegram_send_photo(img, caption=f"{sym} hourly (on-demand)", chat_id=chat_id)
-            return {"ok": True}
-        if cmd in ("temp",):
-            await telegram_send_text("✅ temp OK — bot responds", chat_id=chat_id)
+                    await telegram_send_photo(chat_id, img, caption=f"{sym} hourly (on-demand)")
             return {"ok": True}
         if cmd == "report":
             if not args:
-                await telegram_send_text("Usage: /report SYMBOL (e.g. /report DOGEUSDT)", chat_id=chat_id)
+                await telegram_send_text(chat_id, "Usage: /report SYMBOL")
                 return {"ok": True}
             target = args[0].upper()
             rpt, img = await build_hourly_report(target)
-            await telegram_send_text(rpt[:3800], chat_id=chat_id)
+            await telegram_send_text(chat_id, rpt[:3800])
             if img:
-                await telegram_send_photo(img, caption=f"{target} hourly (manual)", chat_id=chat_id)
+                await telegram_send_photo(chat_id, img, caption=f"{target} hourly (manual)")
             return {"ok": True}
-        # optional: set webhook via command (admin only) - not implemented for security
-        await telegram_send_text("Command not recognized. Use /fast, /temp, or /report SYMBOL", chat_id=chat_id)
-    except Exception:
-        logger.exception("telegram_webhook handling error")
+        if cmd == "start":
+            await telegram_send_text(chat_id, "Привет! Отправь /fast для немедленного отчёта или /report SYMBOL")
+            return {"ok": True}
+        # unknown
+        await telegram_send_text(chat_id, "Команда не распознана. Используйте /fast или /report SYMBOL")
+        return {"ok": True}
+    except Exception as e:
+        logger.exception("telegram_webhook handling failed")
+        # report error back to user (short message)
         try:
-            await telegram_send_text("Internal error handling command.", chat_id=chat_id)
+            await telegram_send_text(chat_id, f"Internal error handling command: {e}")
         except Exception:
-            pass
-    return {"ok": True}
+            logger.exception("failed to notify user about internal error")
+        return {"ok": False, "error": str(e)}
 
 # ------------------------------
-# Run if invoked directly
+# HTTP /fast endpoint (preview)
+# ------------------------------
+@app.get("/fast")
+async def http_fast():
+    try:
+        aggregated = {}
+        for sym in SYMBOLS:
+            txt, _ = await build_hourly_report(sym)
+            aggregated[sym] = txt.splitlines()[:8]
+        return {"ok": True, "preview": aggregated}
+    except Exception as e:
+        logger.exception("http_fast failed")
+        return Response(content=json.dumps({"ok": False, "error": str(e)}), media_type="application/json", status_code=500)
+
+# ------------------------------
+# Lifespan events: start/stop scheduler and client
+# ------------------------------
+@app.on_event("startup")
+async def startup_event():
+    try:
+        if not scheduler.running:
+            scheduler.start()
+            logger.info("Scheduler started")
+    except Exception:
+        logger.exception("Failed to start scheduler")
+    # send startup telegram message (best-effort)
+    try:
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            await telegram_send_text(TELEGRAM_CHAT_ID, "✅ Crypto signal bot started and running 24/7.")
+    except Exception:
+        logger.exception("startup telegram message failed")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+            logger.info("Scheduler stopped")
+    except Exception:
+        logger.exception("Failed to shutdown scheduler")
+    try:
+        await client.aclose()
+    except Exception:
+        logger.exception("Failed to close httpx client")
+
+# ------------------------------
+# Run app with uvicorn main:app --host 0.0.0.0 --port $PORT
 # ------------------------------
 if __name__ == "__main__":
     import uvicorn
