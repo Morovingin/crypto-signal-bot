@@ -1,137 +1,149 @@
 import os
-import io
 import logging
-import httpx
+import asyncio
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+
 from dotenv import load_dotenv
 
 # =======================
-# Настройки
+# 🔹 Настройки логирования
+# =======================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("main")
+
+# =======================
+# 🔹 Загрузка переменных окружения
 # =======================
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("❌ TELEGRAM_BOT_TOKEN не найден в .env")
 
-# FastAPI
-app = FastAPI()
+if not CHAT_ID:
+    raise ValueError("❌ CHAT_ID не найден в .env")
 
-# Планировщик
+# =======================
+# 🔹 FastAPI приложение
+# =======================
+app = FastAPI(title="Trading Bot Reporter")
+
+# =======================
+# 🔹 Планировщик
+# =======================
 scheduler = AsyncIOScheduler()
 
-# Telegram Bot
+# =======================
+# 🔹 Telegram Application
+# =======================
 tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-
 # =======================
-# Bybit API
+# 🔹 Функции отчёта
 # =======================
-async def fetch_klines(symbol: str, interval: str = "60", limit: int = 3, category: str = "spot"):
-    """
-    Загружаем свечи с Bybit API
-    """
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": category, "symbol": symbol, "interval": interval, "limit": limit}
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params=params, timeout=10.0)
-        data = resp.json()
+def generate_fake_report():
+    """Фейковые данные для теста"""
+    now = datetime.now()
+    times = [now - timedelta(hours=i) for i in range(24)][::-1]
+    prices = np.cumsum(np.random.randn(24)) + 100
 
-        # Логируем ответ в Render
-        logger.info(f"Bybit API response for {symbol}/{category}: {data}")
+    df = pd.DataFrame({"time": times, "price": prices})
+    return df
 
-        return data.get("result", {}).get("list", [])
-
-
-# =======================
-# Генерация отчёта
-# =======================
-async def generate_report(symbol: str = "BTCUSDT"):
-    klines = await fetch_klines(symbol, interval="60", limit=3, category="spot")
-
-    if not klines:
-        return f"⚠️ Нет данных от Bybit для {symbol}"
-
-    df = pd.DataFrame(klines, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
-    df["close"] = df["close"].astype(float)
-
-    # Строим график
-    plt.figure(figsize=(6, 3))
-    plt.plot(df["close"], marker="o")
-    plt.title(f"{symbol} — последние {len(df)} свечей")
-    plt.xlabel("Свечи")
-    plt.ylabel("Цена")
-    plt.grid()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
+def plot_report(df: pd.DataFrame, filename: str = "report.png") -> str:
+    """Сохраняет график в PNG"""
+    plt.figure(figsize=(10, 4))
+    plt.plot(df["time"], df["price"], label="Price")
+    plt.title("Test Report")
+    plt.xlabel("Time")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(filename)
     plt.close()
+    return filename
 
-    return buf
+async def send_report(context: ContextTypes.DEFAULT_TYPE, test: bool = False):
+    """Отправка отчёта в Telegram"""
+    try:
+        df = generate_fake_report()
+        filename = plot_report(df, "report.png")
 
+        title = "📊 Тестовый отчёт" if test else "📈 Ежечасный отчёт"
+        await context.bot.send_message(chat_id=CHAT_ID, text=title)
+        await context.bot.send_photo(chat_id=CHAT_ID, photo=open(filename, "rb"))
+
+        logger.info("✅ Отчёт отправлен в Telegram (%s)", title)
+    except Exception as e:
+        logger.error("❌ Ошибка при отправке отчёта: %s", str(e))
 
 # =======================
-# Telegram Handlers
+# 🔹 Команды Telegram
 # =======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Бот работает! Используй /test для проверки отчёта.")
-
+    await update.message.reply_text("👋 Привет! Я бот-репортёр. Доступные команды:\n/test — тестовый отчёт")
 
 async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buf = await generate_report("BTCUSDT")
-    if isinstance(buf, str):
-        await update.message.reply_text(buf)
-    else:
-        await update.message.reply_photo(photo=buf, caption="Тестовый отчёт ✅")
-
+    await update.message.reply_text("🔄 Генерация тестового отчёта...")
+    await send_report(context, test=True)
 
 # =======================
-# Задачи APScheduler
+# 🔹 Задачи планировщика
 # =======================
 async def hourly_task():
-    buf = await generate_report("BTCUSDT")
-    if isinstance(buf, str):
-        await tg_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=buf)
-    else:
-        await tg_app.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=buf, caption="Ежечасный отчёт")
-
+    """Ежечасный отчёт"""
+    class DummyContext:
+        bot = tg_app.bot
+    await send_report(DummyContext(), test=False)
 
 async def daily_task():
-    buf = await generate_report("BTCUSDT")
-    if isinstance(buf, str):
-        await tg_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=buf)
-    else:
-        await tg_app.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=buf, caption="Ежедневный отчёт")
-
+    """Ежедневный отчёт"""
+    class DummyContext:
+        bot = tg_app.bot
+    await send_report(DummyContext(), test=False)
 
 # =======================
-# FastAPI Events
+# 🔹 FastAPI события
 # =======================
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Запуск приложения...")
 
-    # Команды Telegram
+    # Регистрируем команды
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("test", test))
 
     # Планировщик
-    scheduler.add_job(hourly_task, "interval", hours=1, id="hourly_task")
-    scheduler.add_job(daily_task, "interval", days=1, id="daily_task")
+    scheduler.add_job(hourly_task, IntervalTrigger(hours=1), id="hourly_task")
+    scheduler.add_job(daily_task, IntervalTrigger(days=1), id="daily_task")
     scheduler.start()
 
-    # Запускаем Telegram бота в фоне
-    tg_app.create_task(tg_app.run_polling())
+    # Запускаем Telegram-бота внутри uvicorn event loop
+    asyncio.create_task(tg_app.run_polling())
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("🛑 Остановка приложения...")
+    scheduler.shutdown()
 
+# =======================
+# 🔹 Root endpoint
+# =======================
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "FastAPI сервер работает 🚀"}
+    return {"status": "ok", "message": "Trading bot reporter is running"}
