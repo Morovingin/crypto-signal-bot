@@ -268,7 +268,7 @@ def plot_price_and_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> 
 # Build hourly report (async)
 # ------------------------------
 async def build_hourly_report(symbol: str) -> Tuple[str, bytes]:
-    now = datetime.datetime.datetime.utcnow().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    now = datetime.datetime.utcnow().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     lines = [f"⏱️ Hourly report for {symbol} — {now}\n"]
     votes_summary = {}
     chosen_image = b""
