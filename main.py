@@ -2,101 +2,101 @@ import os
 import asyncio
 import logging
 import datetime
-import pandas as pd
 from fastapi import FastAPI, Request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from tvDatafeed import TvDatafeed, Interval
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils.executor import start_webhook
+import yfinance as yf
 
-# ---------------------------------------------------
-# ЛОГИРОВАНИЕ
-# ---------------------------------------------------
+# ----------------------------
+# Конфигурация
+# ----------------------------
+API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # токен телеграм-бота
+WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://crypto-signal-bot.onrender.com")
+WEBHOOK_PATH = "/telegram_webhook"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 10000))
+
+# ----------------------------
+# Логирование
+# ----------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------
-# TELEGRAM
-# ---------------------------------------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # твой render URL
+# ----------------------------
+# Telegram bot
+# ----------------------------
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
 
-application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-# ---------------------------------------------------
-# TRADINGVIEW API
-# ---------------------------------------------------
-tv = TvDatafeed()  # анонимный вход, можно добавить логин/пароль если надо
-
-interval_map = {
-    "15m": Interval.in_15_minute,
-    "1h": Interval.in_1_hour,
-    "4h": Interval.in_4_hour,
-    "12h": Interval.in_12_hour,
-    "1d": Interval.in_daily,
-}
-
-async def fetch_tradingview_klines(symbol: str, interval: str, limit: int = 200):
-    try:
-        # Приводим к виду ADA/USDT → ADAUSDT
-        if symbol.endswith("USDT"):
-            ticker = symbol.replace("USDT", "/USDT")
-        else:
-            ticker = symbol
-
-        bars = tv.get_hist(symbol=ticker, exchange="BINANCE", interval=interval_map[interval], n_bars=limit)
-        if bars is None or bars.empty:
-            raise RuntimeError("TradingView returned empty data")
-        return bars
-    except Exception as e:
-        logger.error(f"TradingView fetch failed for {symbol} {interval}: {e}")
-        raise
-
-async def fetch_klines(symbol: str, interval: str, limit: int = 200):
-    return await fetch_tradingview_klines(symbol, interval, limit)
-
-# ---------------------------------------------------
-# ОБРАБОТЧИКИ КОМАНД
-# ---------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я бот для анализа криптовалют. Используй /fast для проверки сигнала.")
-
-async def fast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol = "DOGEUSDT"
-    try:
-        df = await fetch_klines(symbol, "1h", limit=100)
-        last_close = df["close"].iloc[-1]
-        await update.message.reply_text(f"{symbol} (1H) последняя цена: {last_close}")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка получения данных: {e}")
-
-# ---------------------------------------------------
-# TELEGRAM ROUTES
-# ---------------------------------------------------
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("fast", fast))
-
-# ---------------------------------------------------
-# FASTAPI
-# ---------------------------------------------------
+# ----------------------------
+# FastAPI
+# ----------------------------
 app = FastAPI()
 
-@app.post(f"/telegram_webhook/{TELEGRAM_TOKEN}")
-async def telegram_webhook(req: Request):
-    data = await req.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return {"ok": True}
 
 @app.get("/")
 async def root():
+    """Health-check для UptimeRobot"""
     return {
         "status": "ok",
         "time": datetime.datetime.utcnow().isoformat()
     }
 
-# ---------------------------------------------------
-# СТАРТ
-# ---------------------------------------------------
-if __name__ == "__main__":
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    """Обработка апдейтов от Telegram"""
+    data = await request.json()
+    update = types.Update(**data)
+    await dp.process_update(update)
+    return {"ok": True}
+
+# ----------------------------
+# Команды бота
+# ----------------------------
+@dp.message_handler(commands=["start", "help"])
+async def send_welcome(message: types.Message):
+    await message.answer("Привет! Я бот с криптосигналами.\n"
+                         "Доступные команды:\n"
+                         "/test — проверить соединение\n"
+                         "/fast — быстрый курс BTC/ETH\n")
+
+
+@dp.message_handler(commands=["test"])
+async def cmd_test(message: types.Message):
+    await message.answer("✅ Бот работает! Webhook активен.")
+
+
+@dp.message_handler(commands=["fast"])
+async def cmd_fast(message: types.Message):
+    try:
+        btc = yf.Ticker("BTC-USD").history(period="1d")["Close"].iloc[-1]
+        eth = yf.Ticker("ETH-USD").history(period="1d")["Close"].iloc[-1]
+        await message.answer(f"⚡ Быстрый курс:\n"
+                             f"BTC: {btc:.2f} USD\n"
+                             f"ETH: {eth:.2f} USD")
+    except Exception as e:
+        logging.error(f"Ошибка /fast: {e}")
+        await message.answer("Ошибка при получении данных с TradingView (yfinance).")
+
+# ----------------------------
+# Запуск бота
+# ----------------------------
+async def on_startup(dp):
+    logging.info("Устанавливаю webhook...")
+    await bot.set_webhook(WEBHOOK_URL)
+
+async def on_shutdown(dp):
+    logging.warning("Выключение бота...")
+    await bot.delete_webhook()
+
+def main():
+    # aiogram через FastAPI
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    loop = asyncio.get_event_loop()
+    loop.create_task(on_startup(dp))
+    uvicorn.run(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+
+if __name__ == "__main__":
+    main()
