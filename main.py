@@ -409,7 +409,7 @@ app = FastAPI(title="Crypto Signal Bot")
 async def root():
     return {
         "status": "crypto-signal-bot running",
-        "time": datetime.datetime.datetime.utcnow().isoformat(),
+        "time": datetime.datetime.utcnow().isoformat(),
         "exchange": EXCHANGE
     }
 
