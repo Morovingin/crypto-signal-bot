@@ -1,203 +1,481 @@
+# main.py
 import os
+import io
+import time
+import json
 import logging
 import datetime
-import io
+from typing import Dict, Tuple
+
 import httpx
+import numpy as np
 import pandas as pd
+import matplotlib
+# avoid permission issues for font cache on restricted environments
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import matplotlib.pyplot as plt
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler
+from fastapi import FastAPI, Response
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# === Logging ===
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# TA indicators from `ta` package
+from ta.momentum import RSIIndicator, StochRSIIndicator
+from ta.trend import MACD, SMAIndicator, EMAIndicator
+from ta.volatility import BollingerBands
 
-# === ENV VARIABLES ===
+# ------------------------------
+# Logging
+# ------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("crypto-signal-bot")
+
+# ------------------------------
+# Config / environment
+# ------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+PORT = int(os.getenv("PORT", "10000"))
+EXCHANGE = os.getenv("EXCHANGE", "BYBIT").upper()  # BYBIT or BINANCE
+SCHED_TZ = os.getenv("SCHED_TZ", "Europe/Moscow")
 
-# === Init ===
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-app = FastAPI()
-scheduler = AsyncIOScheduler()
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set - telegram notifications will fail")
 
-# === Telegram bot with handlers ===
-tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+# Bybit / Binance endpoints
+BYBIT_KLINES_ENDPOINT = "https://api.bybit.com/public/linear/kline"
+BINANCE_KLINES_ENDPOINT = "https://api.binance.com/api/v3/klines"
 
-# === SYMBOLS TO TRACK ===
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOGEUSDT"]
+SYMBOLS = ["DOGEUSDT", "ADAUSDT"]
+TIMEFRAMES = {
+    "15m": {"interval": "15m", "limit": 200},
+    "1h": {"interval": "1h", "limit": 200},
+    "4h": {"interval": "4h", "limit": 200},
+    "12h": {"interval": "12h", "limit": 200}
+}
 
-# ========================
-#   FETCH DATA FROM BYBIT
-# ========================
-async def fetch_ohlcv(symbol: str, interval: str, limit: int = 200):
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "spot",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": str(limit)
+# ------------------------------
+# HTTP client
+# ------------------------------
+# single client for reuse
+client = httpx.Client(timeout=30.0)
+
+# ------------------------------
+# Helpers: fetch klines
+# ------------------------------
+def fetch_binance_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    r = client.get(BINANCE_KLINES_ENDPOINT, params=params)
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        raise RuntimeError("Empty kline data from Binance")
+    df = pd.DataFrame(data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time","quote_asset_volume","num_trades",
+        "taker_buy_base_asset_volume","taker_buy_quote_asset_volume","ignore"
+    ])
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.set_index("open_time", inplace=True)
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    return df[["open","high","low","close","volume"]]
+
+def fetch_bybit_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    # map "15m","1h",... to Bybit interval param (minutes)
+    mapping = {"15m":"15", "1h":"60", "4h":"240", "12h":"720"}
+    if interval not in mapping:
+        raise ValueError("Unsupported interval for Bybit: " + interval)
+    params = {"symbol": symbol.upper(), "interval": mapping[interval], "limit": limit}
+    r = client.get(BYBIT_KLINES_ENDPOINT, params=params)
+    r.raise_for_status()
+    jd = r.json()
+    # Bybit returns { "ret_code":0, "result":[{...}, ...] } OR {"result":{"list":[...]}}
+    data = []
+    if isinstance(jd, dict):
+        if "result" in jd:
+            res = jd["result"]
+            if isinstance(res, list):
+                data = res
+            elif isinstance(res, dict) and "list" in res:
+                data = res["list"]
+    if not data:
+        raise RuntimeError("Empty kline data from Bybit: " + json.dumps(jd)[:500])
+    df = pd.DataFrame(data)
+    # Bybit may use 'start_at' (unix seconds) or 'open_time'
+    if "start_at" in df.columns:
+        df["open_time"] = pd.to_datetime(df["start_at"], unit="s")
+    elif "open_time" in df.columns:
+        # some endpoints use seconds
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="s")
+    else:
+        # fallback: first column numeric unix timestamp
+        df["open_time"] = pd.to_datetime(df.iloc[:, 0], unit="s")
+    df.set_index("open_time", inplace=True)
+    # normalize expected columns
+    # Bybit might use lowercase or capitalized names
+    for col in ["open","high","low","close","volume"]:
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+        elif col.capitalize() in df.columns:
+            df[col] = df[col.capitalize()].astype(float)
+        else:
+            # can't find column — create zeros to avoid crashes
+            df[col] = 0.0
+    return df[["open","high","low","close","volume"]]
+
+def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    """Unified fetch: uses EXCHANGE env var to choose source (BYBIT or BINANCE)."""
+    try:
+        if EXCHANGE == "BYBIT":
+            return fetch_bybit_klines(symbol, interval, limit=limit)
+        else:
+            return fetch_binance_klines(symbol, interval, limit=limit)
+    except Exception as e:
+        logger.exception("fetch_klines failed for %s %s on exchange %s", symbol, interval, EXCHANGE)
+        raise
+
+# ------------------------------
+# Indicators
+# ------------------------------
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    close = out["close"]
+    # RSI
+    out["rsi"] = RSIIndicator(close=close, window=14, fillna=True).rsi()
+    # MACD
+    macd = MACD(close=close, window_slow=26, window_fast=12, window_sign=9, fillna=True)
+    out["macd_line"] = macd.macd()
+    out["macd_signal"] = macd.macd_signal()
+    out["macd_hist"] = macd.macd_diff()
+    # Bollinger
+    bb = BollingerBands(close=close, window=20, window_dev=2, fillna=True)
+    out["bb_mavg"] = bb.bollinger_mavg()
+    out["bb_hband"] = bb.bollinger_hband()
+    out["bb_lband"] = bb.bollinger_lband()
+    out["bb_pct"] = (close - out["bb_lband"]) / (out["bb_hband"] - out["bb_lband"] + 1e-12)
+    # SMA/EMA
+    out["sma20"] = SMAIndicator(close=close, window=20, fillna=True).sma_indicator()
+    out["sma50"] = SMAIndicator(close=close, window=50, fillna=True).sma_indicator()
+    out["ema20"] = EMAIndicator(close=close, window=20, fillna=True).ema_indicator()
+    out["ema50"] = EMAIndicator(close=close, window=50, fillna=True).ema_indicator()
+    # Stoch RSI
+    stoch = StochRSIIndicator(close=close, window=14, smooth1=3, smooth2=3, fillna=True)
+    out["stoch_rsi_k"] = stoch.stochrsi_k()
+    out["stoch_rsi_d"] = stoch.stochrsi_d()
+    return out
+
+# ------------------------------
+# Support / Fib helpers
+# ------------------------------
+def pivot_support_resistance(series: pd.Series) -> Dict[str, float]:
+    try:
+        high = float(series["high"])
+        low = float(series["low"])
+        close = float(series["close"])
+        pivot = (high + low + close) / 3.0
+        r1 = 2*pivot - low
+        s1 = 2*pivot - high
+        return {"pivot": pivot, "r1": r1, "s1": s1}
+    except Exception:
+        return {"pivot": 0.0, "r1": 0.0, "s1": 0.0}
+
+def fib_levels(last_low: float, last_high: float) -> Dict[str, float]:
+    diff = last_high - last_low
+    return {
+        "0.0%": last_high,
+        "23.6%": last_high - 0.236*diff,
+        "38.2%": last_high - 0.382*diff,
+        "50.0%": last_high - 0.5*diff,
+        "61.8%": last_high - 0.618*diff,
+        "100.0%": last_low
     }
+
+# ------------------------------
+# Signal scoring
+# ------------------------------
+def score_signals(ind_df: pd.DataFrame) -> Tuple[str, Dict[str,int]]:
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+        row = ind_df.iloc[-1]
+        votes = {"buy": 0, "sell": 0, "neutral": 0}
+        # RSI
+        if row["rsi"] < 30:
+            votes["buy"] += 1
+        elif row["rsi"] > 70:
+            votes["sell"] += 1
+        # MACD hist
+        if row["macd_hist"] > 0:
+            votes["buy"] += 1
+        elif row["macd_hist"] < 0:
+            votes["sell"] += 1
+        # EMA trend
+        if row["close"] > row["ema20"]:
+            votes["buy"] += 1
+        else:
+            votes["sell"] += 1
+        # Bollinger
+        if row["bb_pct"] > 0.85:
+            votes["sell"] += 1
+        elif row["bb_pct"] < 0.15:
+            votes["buy"] += 1
+        # Stoch RSI K (it's 0..100)
+        if row["stoch_rsi_k"] < 20:
+            votes["buy"] += 1
+        elif row["stoch_rsi_k"] > 80:
+            votes["sell"] += 1
+        # Volume momentum
+        vol_mean = ind_df["volume"].tail(50).mean() if len(ind_df) >= 50 else ind_df["volume"].mean()
+        if vol_mean > 0 and row["volume"] > vol_mean * 1.5:
+            if row["macd_hist"] > 0:
+                votes["buy"] += 1
+            elif row["macd_hist"] < 0:
+                votes["sell"] += 1
+        score = votes["buy"] - votes["sell"]
+        if score >= 2:
+            return "BUY", votes
+        elif score <= -2:
+            return "SELL", votes
+        else:
+            return "HOLD", votes
+    except Exception:
+        return "HOLD", {"buy":0,"sell":0,"neutral":0}
 
-            if data.get("retCode") != 0:
-                logging.error(f"Bybit API error: {data}")
-                return None
-
-            rows = data["result"]["list"]
-            df = pd.DataFrame(rows, columns=[
-                "timestamp", "open", "high", "low", "close", "volume", "turnover"
-            ])
-            df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms")
-            df = df.astype({
-                "open": "float",
-                "high": "float",
-                "low": "float",
-                "close": "float",
-                "volume": "float"
-            })
-            df.set_index("timestamp", inplace=True)
-            df.sort_index(inplace=True)
-            return df
-    except Exception as e:
-        logging.error(f"fetch_ohlcv error for {symbol} {interval}: {e}")
-        return None
-
-# ========================
-#   INDICATORS
-# ========================
-def compute_indicators(df: pd.DataFrame):
-    if df is None or df.empty:
-        return None
+# ------------------------------
+# Charting
+# ------------------------------
+def plot_price_and_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> bytes:
     try:
-        df["MA20"] = df["close"].rolling(window=20).mean()
-        df["MA50"] = df["close"].rolling(window=50).mean()
+        plt.switch_backend("Agg")
+        fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True, gridspec_kw={"height_ratios":[3,1,1]})
+        ax_price, ax_macd, ax_rsi = axes
+        ax_price.plot(df.index, df["close"], label=f"{symbol} close")
+        if "sma20" in df.columns:
+            ax_price.plot(df.index, df["sma20"], label="SMA20", linewidth=0.8)
+        if "ema20" in df.columns:
+            ax_price.plot(df.index, df["ema20"], label="EMA20", linewidth=0.8)
+        if "bb_hband" in df.columns and "bb_lband" in df.columns:
+            ax_price.plot(df.index, df["bb_hband"], linestyle="--", linewidth=0.7, label="BB Upper")
+            ax_price.plot(df.index, df["bb_lband"], linestyle="--", linewidth=0.7, label="BB Lower")
+        ax_price.set_title(f"{symbol} {timeframe} — price & indicators")
+        ax_price.legend(loc="upper left")
+        ax_price.grid(True)
+        # MACD
+        if "macd_line" in df.columns:
+            ax_macd.plot(df.index, df["macd_line"], label="MACD")
+            ax_macd.plot(df.index, df["macd_signal"], label="Signal")
+            ax_macd.bar(df.index, df["macd_hist"], label="Hist", alpha=0.6)
+            ax_macd.legend(loc="upper left")
+            ax_macd.grid(True)
+        # RSI
+        if "rsi" in df.columns:
+            ax_rsi.plot(df.index, df["rsi"], label="RSI")
+            ax_rsi.axhline(70, linestyle="--", linewidth=0.6)
+            ax_rsi.axhline(30, linestyle="--", linewidth=0.6)
+            ax_rsi.legend(loc="upper left")
+            ax_rsi.grid(True)
+        plt.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=130)
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+    except Exception:
+        logger.exception("plot_price_and_indicators failed")
+        return b""
 
-        delta = df["close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        df["RSI"] = 100 - (100 / (1 + rs))
-        return df
-    except Exception as e:
-        logging.error(f"compute_indicators error: {e}")
-        return None
+# ------------------------------
+# Report building
+# ------------------------------
+def build_hourly_report(symbol: str) -> Tuple[str, bytes]:
+    now = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    lines = [f"⏱ Hourly report for {symbol} — {now}\n"]
+    votes_summary = {}
+    chosen_image = b""
+    for tf_label, tf_conf in TIMEFRAMES.items():
+        try:
+            df = fetch_klines(symbol, tf_conf["interval"], limit=tf_conf["limit"])
+            if df.empty or len(df) < 10:
+                lines.append(f"TF: {tf_label} — not enough data")
+                continue
+            ind = compute_indicators(df)
+            rec, votes = score_signals(ind)
+            last = df.tail(3)
+            lastc = {"high": last["high"].iloc[-1], "low": last["low"].iloc[-1], "close": last["close"].iloc[-1]}
+            piv = pivot_support_resistance(lastc)
+            window = df.tail(60)
+            low = float(window["low"].min())
+            high = float(window["high"].max())
+            fibs = fib_levels(low, high)
+            lines.append(f"TF: {tf_label} | Price: {df['close'].iloc[-1]:.6f} | Rec: {rec} | RSI:{ind['rsi'].iloc[-1]:.1f} | MACD_hist:{ind['macd_hist'].iloc[-1]:.6f}")
+            lines.append(f"  Pivot:{piv['pivot']:.6f}, R1:{piv['r1']:.6f}, S1:{piv['s1']:.6f}")
+            lines.append(f"  Fib 23.6%:{fibs['23.6%']:.6f} 38.2%:{fibs['38.2%']:.6f} 50%:{fibs['50.0%']:.6f}")
+            votes_summary[tf_label] = {"rec": rec, "votes": votes}
+            if tf_label == "4h" and not chosen_image:
+                chosen_image = plot_price_and_indicators(ind.tail(200), symbol, tf_label)
+            elif not chosen_image:
+                chosen_image = plot_price_and_indicators(ind.tail(200), symbol, tf_label)
+        except Exception:
+            logger.exception("build_hourly_report: error for %s %s", symbol, tf_label)
+            lines.append(f"TF: {tf_label} — error computing data")
+    # Aggregate final
+    counts = {"BUY":0,"SELL":0,"HOLD":0}
+    for tf, d in votes_summary.items():
+        counts[d["rec"]] = counts.get(d["rec"], 0) + 1
+    final = max(counts.items(), key=lambda x: x[1])[0] if counts else "HOLD"
+    # SL/TP heuristic
+    try:
+        latest_price = float(fetch_klines(symbol, "1h", limit=3)["close"].iloc[-1])
+        sl = latest_price * (0.98 if final == "BUY" else 1.02)
+        tp = latest_price * (1.04 if final == "BUY" else 0.96)
+    except Exception:
+        sl = tp = 0.0
+    header = f"Final recommendation for {symbol}: {final}\nSL: {sl:.6f} TP: {tp:.6f}\n"
+    text = header + "\n".join(lines)
+    return text, chosen_image
 
-# ========================
-#   REPORT BUILDER
-# ========================
-async def build_report(symbol: str, interval: str):
-    df = await fetch_ohlcv(symbol, interval, 200)
-    df = compute_indicators(df)
-    if df is None or df.empty:
-        return f"{symbol} — error computing data", None
+# ------------------------------
+# Telegram helpers
+# ------------------------------
+def telegram_send_text(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("telegram_send_text skipped: missing token/chat_id")
+        return None, "missing token/chat"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    try:
+        r = client.post(url, json=payload, timeout=15.0)
+        r.raise_for_status()
+        return r.status_code, r.text
+    except Exception:
+        logger.exception("telegram_send_text failed")
+        return None, "error"
 
-    last = df.iloc[-1]
-    text = (
-        f"📊 Report for {symbol} ({interval})\n"
-        f"Close: {last['close']:.4f}\n"
-        f"MA20: {last['MA20']:.4f}\n"
-        f"MA50: {last['MA50']:.4f}\n"
-        f"RSI: {last['RSI']:.2f}\n"
-    )
+def telegram_send_photo(image_bytes: bytes, caption: str = ""):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("telegram_send_photo skipped: missing token/chat_id")
+        return None, "missing token/chat"
+    if not image_bytes:
+        logger.warning("telegram_send_photo skipped: empty image")
+        return None, "empty image"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    files = {"photo": ("chart.png", image_bytes, "image/png")}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
+    try:
+        r = client.post(url, data=data, files=files, timeout=30.0)
+        r.raise_for_status()
+        return r.status_code, r.text
+    except Exception:
+        logger.exception("telegram_send_photo failed")
+        return None, "error"
 
-    # === chart ===
-    fig, ax = plt.subplots(figsize=(8, 4))
-    df["close"].plot(ax=ax, label="Close", color="blue")
-    df["MA20"].plot(ax=ax, label="MA20", color="orange")
-    df["MA50"].plot(ax=ax, label="MA50", color="red")
-    ax.set_title(f"{symbol} {interval} chart")
-    ax.legend()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    plt.close(fig)
-
-    return text, buf
-
-# ========================
-#   TASKS
-# ========================
-async def hourly_task():
-    logging.info("Running hourly task...")
+# ------------------------------
+# Tasks
+# ------------------------------
+def hourly_task():
+    logger.info("Hourly task started")
     for sym in SYMBOLS:
         try:
-            text, img = await build_report(sym, "60")
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+            text, img = build_hourly_report(sym)
+            # Telegram safe cut to ~4000 chars
+            telegram_send_text(text[:3800])
             if img:
-                await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img)
-        except Exception as e:
-            logging.error(f"hourly_task error {sym}: {e}")
-    logging.info("Hourly task finished")
+                telegram_send_photo(img, caption=f"{sym} hourly chart")
+            time.sleep(0.5)
+        except Exception:
+            logger.exception("hourly_task error for %s", sym)
+    logger.info("Hourly task finished")
 
-async def daily_task():
-    logging.info("Running daily task...")
+def daily_task():
+    logger.info("Daily task started")
     for sym in SYMBOLS:
         try:
-            text, img = await build_report(sym, "D")
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+            text, img = build_hourly_report(sym)
+            telegram_send_text("📈 DAILY REPORT\n" + text[:3800])
             if img:
-                await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img)
-        except Exception as e:
-            logging.error(f"daily_task error {sym}: {e}")
-    logging.info("Daily task finished")
+                telegram_send_photo(img, caption=f"{sym} daily chart")
+            time.sleep(0.5)
+        except Exception:
+            logger.exception("daily_task error for %s", sym)
+    logger.info("Daily task finished")
 
-# ========================
-#   TEST ENDPOINT (BROWSER)
-# ========================
-@app.get("/test")
-async def test_report():
-    text, img = await build_report("BTCUSDT", "60")
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-    if img:
-        await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img)
-    return {"status": "test report sent"}
+# ------------------------------
+# Scheduler (created here but started in startup)
+# ------------------------------
+scheduler = BackgroundScheduler(timezone=SCHED_TZ)
+# schedule jobs but don't start yet
+scheduler.add_job(hourly_task, "cron", minute=1, id="hourly_task")
+scheduler.add_job(daily_task, "cron", hour=4, minute=2, id="daily_task")
 
-# ========================
-#   TELEGRAM COMMAND /test
-# ========================
-async def command_test(update: Update, context):
-    text, img = await build_report("BTCUSDT", "60")
-    await update.message.reply_text(text)
-    if img:
-        await update.message.reply_photo(img)
+# ------------------------------
+# FastAPI app
+# ------------------------------
+app = FastAPI(title="Crypto Signal Bot")
 
-tg_app.add_handler(CommandHandler("test", command_test))
-
-# ========================
-#   SCHEDULER
-# ========================
-@app.on_event("startup")
-async def startup_event():
-    scheduler.add_job(hourly_task, "cron", minute=1)
-    scheduler.add_job(daily_task, "cron", hour=0, minute=5)
-    scheduler.start()
-    tg_app.initialize()
-    tg_app.post_init()
-    logging.info("Scheduler + Telegram bot started")
-
-# ========================
-#   ROOT (UPTIME ROBOT)
-# ========================
-@app.get("/")
+# Allow both GET and HEAD on root for uptime monitors
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return JSONResponse({
-        "status": "ok",
-        "time": datetime.datetime.utcnow().isoformat()
-    })
+    return {
+        "status": "crypto-signal-bot running",
+        "time": datetime.datetime.utcnow().isoformat(),
+        "service": "crypto-signal-bot",
+        "exchange": EXCHANGE
+    }
 
-# ========================
-#   RUN SERVER
-# ========================
+@app.get("/health")
+async def health_check():
+    try:
+        df = fetch_klines("BTCUSDT" if EXCHANGE == "BINANCE" else "BTCUSDT", "1m", 1)
+        return {"status": "healthy", "exchange": EXCHANGE, "timestamp": datetime.datetime.datetime.utcnow().isoformat()}
+    except Exception as e:
+        logger.exception("health_check failure")
+        return Response(
+            content=json.dumps({"status":"unhealthy","error": str(e), "timestamp": datetime.datetime.datetime.utcnow().isoformat()}),
+            status_code=500,
+            media_type="application/json"
+        )
+
+@app.get("/status")
+async def status():
+    return {"status": "ok", "message": "Service is running"}
+
+@app.get("/ping")
+async def ping():
+    # Return plain text 'pong' for uptime monitors
+    return Response(content="pong", media_type="text/plain")
+
+# ------------------------------
+# Lifespan events: start/stop scheduler
+# ------------------------------
+@app.on_event("startup")
+def on_startup():
+    # start scheduler
+    try:
+        if not scheduler.running:
+            scheduler.start()
+            logger.info("Scheduler started")
+    except Exception:
+        logger.exception("Failed to start scheduler")
+    # send startup telegram message (non-blocking best-effort)
+    try:
+        telegram_send_text("✅ Crypto signal bot deployed and running 24/7.")
+    except Exception:
+        logger.exception("startup telegram message failed")
+
+@app.on_event("shutdown")
+def on_shutdown():
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+            logger.info("Scheduler shutdown")
+    except Exception:
+        logger.exception("Failed to shutdown scheduler")
+
+# ------------------------------
+# Run server when module executed directly
+# ------------------------------
 if __name__ == "__main__":
-    import uvicorn, asyncio
-    loop = asyncio.get_event_loop()
-    loop.create_task(tg_app.run_polling())
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    uvicorn.run(app, host="0.0.0.0", port=PORT, timeout_keep_alive=300)
