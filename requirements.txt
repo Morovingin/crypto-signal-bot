@@ -7,4 +7,4 @@ pandas==1.5.3
 numpy==1.23.5
 pytz==2024.1
 yfinance==0.2.22
-git+https://github.com/StreamAlpha/tvdatafeed.git
+tvdatafeed-reborn==1.0.5
