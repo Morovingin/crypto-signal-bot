@@ -2,64 +2,48 @@ import os
 import logging
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 from aiogram.types import Update
-from aiogram.utils.executor import start_webhook
-
-# ----------------------------
-# Конфигурация
-# ----------------------------
-TOKEN = os.getenv("BOT_TOKEN")  # Твой токен бота из Render Secret
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")  # Render сам выдаёт HTTPS-домен
-WEBHOOK_PATH = f"/webhook/{TOKEN}"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
 
 logging.basicConfig(level=logging.INFO)
 
-# ----------------------------
-# FastAPI приложение
-# ----------------------------
+TOKEN = os.getenv("BOT_TOKEN")  # положи сюда токен через Render secrets
+WEBHOOK_PATH = f"/webhook/{TOKEN}"
+WEBHOOK_URL = f"https://crypto-signal-bot-1-md7v.onrender.com{WEBHOOK_PATH}"
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
 app = FastAPI()
 
 
+# === Хэндлеры ===
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Привет! Я живой и работаю через вебхуки 🚀")
+
+
+@dp.message()
+async def echo(message: types.Message):
+    await message.answer(f"Ты написал: {message.text}")
+
+
+# === FastAPI routes ===
 @app.on_event("startup")
 async def on_startup():
-    """Устанавливаем вебхук в Telegram при запуске"""
-    logging.info("Setting webhook to %s", WEBHOOK_URL)
     await bot.set_webhook(WEBHOOK_URL)
+    logging.info(f"Webhook set to {WEBHOOK_URL}")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    """Удаляем вебхук при остановке"""
-    logging.info("Deleting webhook")
     await bot.delete_webhook()
+    logging.info("Webhook deleted")
 
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    """Обработка апдейтов от Telegram"""
     data = await request.json()
-    update = Update(**data)
-    await dp.process_update(update)
+    update = Update.model_validate(data)
+    await dp.feed_update(bot, update)
     return {"ok": True}
-
-# ----------------------------
-# Хэндлеры бота
-# ----------------------------
-
-@dp.message_handler(commands=["start", "help"])
-async def send_welcome(message: types.Message):
-    await message.reply("Привет! Я твой бот на Render 🚀")
-
-
-@dp.message_handler(commands=["ping"])
-async def ping(message: types.Message):
-    await message.answer("Pong 🏓")
-
-
-@dp.message_handler()
-async def echo(message: types.Message):
-    await message.answer(f"Ты написал: {message.text}")
