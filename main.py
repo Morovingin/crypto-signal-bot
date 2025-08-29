@@ -7,7 +7,7 @@ from aiogram.types import Update
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN")  # положи сюда токен через Render secrets
+TOKEN = os.getenv("BOT_TOKEN")  # Render secrets
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 WEBHOOK_URL = f"https://crypto-signal-bot-1-md7v.onrender.com{WEBHOOK_PATH}"
 
