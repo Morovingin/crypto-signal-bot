@@ -1,87 +1,65 @@
-import logging
 import os
-import pandas as pd
-from aiogram import Bot, Dispatcher, executor, types
-from tradingview_ta import TA_Handler, Interval
+import logging
+from fastapi import FastAPI, Request
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import Update
+from aiogram.utils.executor import start_webhook
 
-# Логирование
-logging.basicConfig(level=logging.INFO)
+# ----------------------------
+# Конфигурация
+# ----------------------------
+TOKEN = os.getenv("BOT_TOKEN")  # Твой токен бота из Render Secret
+WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")  # Render сам выдаёт HTTPS-домен
+WEBHOOK_PATH = f"/webhook/{TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-# Настройки Telegram (токен из переменной окружения)
-API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
-if not API_TOKEN:
-    raise RuntimeError("Ошибка: не найден TELEGRAM_API_TOKEN в переменных окружения")
-
-bot = Bot(token=API_TOKEN)
+bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
-# Символы для анализа
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+logging.basicConfig(level=logging.INFO)
 
-# Поддерживаемые таймфреймы
-TIMEFRAMES = {
-    "1h": Interval.INTERVAL_1_HOUR,
-    "4h": Interval.INTERVAL_4_HOURS,
-    "1d": Interval.INTERVAL_1_DAY,
-}
+# ----------------------------
+# FastAPI приложение
+# ----------------------------
+app = FastAPI()
 
-# === Получение данных из TradingView ===
-def fetch_klines(symbol: str, interval: str):
-    try:
-        tv_interval = TIMEFRAMES.get(interval, Interval.INTERVAL_1_HOUR)
 
-        handler = TA_Handler(
-            symbol=symbol,
-            screener="crypto",
-            exchange="BINANCE",  # можно заменить на "COINBASE" или "KUCOIN"
-            interval=tv_interval,
-        )
+@app.on_event("startup")
+async def on_startup():
+    """Устанавливаем вебхук в Telegram при запуске"""
+    logging.info("Setting webhook to %s", WEBHOOK_URL)
+    await bot.set_webhook(WEBHOOK_URL)
 
-        analysis = handler.get_analysis()
-        indicators = analysis.indicators
-        summary = analysis.summary
 
-        # Делаем DataFrame для удобства
-        df = pd.DataFrame([indicators])
-        df["BUY"] = summary.get("BUY", 0)
-        df["SELL"] = summary.get("SELL", 0)
-        df["NEUTRAL"] = summary.get("NEUTRAL", 0)
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Удаляем вебхук при остановке"""
+    logging.info("Deleting webhook")
+    await bot.delete_webhook()
 
-        return df
-    except Exception as e:
-        logging.error(f"TradingView fetch failed for {symbol} {interval}: {e}")
-        raise RuntimeError(f"TradingView fetch failed for {symbol} {interval}: {e}")
 
-# === Формирование отчёта ===
-def build_report(symbol: str):
-    report = f"📊 Отчёт по {symbol}\n"
-    for tf in TIMEFRAMES.keys():
-        try:
-            df = fetch_klines(symbol, tf)
-            if df is not None and not df.empty:
-                buy = df['BUY'].iloc[0]
-                sell = df['SELL'].iloc[0]
-                neutral = df['NEUTRAL'].iloc[0]
-                report += f"\n⏱ {tf}:\n✅ BUY: {buy}\n❌ SELL: {sell}\n➖ NEUTRAL: {neutral}\n"
-            else:
-                report += f"\n⏱ {tf}: Нет данных\n"
-        except Exception as e:
-            report += f"\n⏱ {tf}: Ошибка ({e})\n"
-    return report
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    """Обработка апдейтов от Telegram"""
+    data = await request.json()
+    update = Update(**data)
+    await dp.process_update(update)
+    return {"ok": True}
 
-# === Telegram-команды ===
-@dp.message_handler(commands=["start"])
+# ----------------------------
+# Хэндлеры бота
+# ----------------------------
+
+@dp.message_handler(commands=["start", "help"])
 async def send_welcome(message: types.Message):
-    await message.reply("👋 Привет! Я бот для анализа криптовалют с TradingView.\n"
-                        "Напиши /report, чтобы получить отчёт.")
+    await message.reply("Привет! Я твой бот на Render 🚀")
 
-@dp.message_handler(commands=["report"])
-async def send_report(message: types.Message):
-    reply = ""
-    for symbol in SYMBOLS:
-        reply += build_report(symbol) + "\n\n"
-    await message.reply(reply)
 
-# === Запуск бота ===
-if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+@dp.message_handler(commands=["ping"])
+async def ping(message: types.Message):
+    await message.answer("Pong 🏓")
+
+
+@dp.message_handler()
+async def echo(message: types.Message):
+    await message.answer(f"Ты написал: {message.text}")
